@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import glob
+import json
 from pathlib import Path
 from typing import Iterator
 
@@ -9,6 +10,37 @@ import torch
 
 
 SUPPORTED_SUFFIXES = {".bin", ".npy"}
+
+
+def validate_data_manifest(
+    manifest_path: str,
+    *,
+    vocab_size: int,
+    eos_token_id: int,
+    binary_dtype: str,
+) -> dict[str, object]:
+    """Fail early if tokenized data and the model/tokenizer contract disagree."""
+    path = Path(manifest_path).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"token data manifest not found: {path}")
+    with path.open("r", encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    tokenizer = manifest.get("tokenizer")
+    if not isinstance(tokenizer, dict):
+        raise ValueError(f"missing tokenizer metadata in {path}")
+    observed_vocab = int(tokenizer.get("vocab_size", -1))
+    observed_eos = int(tokenizer.get("eos_token_id", -1))
+    observed_dtype = str(manifest.get("dtype", ""))
+    mismatches: list[str] = []
+    if observed_vocab != vocab_size:
+        mismatches.append(f"vocab_size manifest={observed_vocab} config={vocab_size}")
+    if observed_eos != eos_token_id:
+        mismatches.append(f"eos_token_id manifest={observed_eos} config={eos_token_id}")
+    if observed_dtype != binary_dtype:
+        mismatches.append(f"dtype manifest={observed_dtype} config={binary_dtype}")
+    if mismatches:
+        raise ValueError(f"token data contract mismatch in {path}: " + "; ".join(mismatches))
+    return manifest
 
 
 def resolve_token_shards(path: str, patterns: str = "*.bin,*.npy") -> list[Path]:
@@ -157,4 +189,3 @@ def sequential_token_batches(
     if pending and (max_batches <= 0 or yielded_batches < max_batches):
         batch = torch.from_numpy(np.stack(pending, axis=0))
         yield batch[:, :-1], batch[:, 1:]
-

@@ -55,7 +55,7 @@ class CheckpointHarnessLM(TemplateLM):  # type: ignore[misc]
         self._max_gen_toks = int(max_gen_toks)
         self._precision = precision
         tokenizer_size = len(self.tokenizer)
-        if tokenizer_size > self.model.config.vocab_size:
+        if tokenizer_size != self.model.config.vocab_size:
             raise ValueError(
                 f"tokenizer has {tokenizer_size} tokens but model vocabulary has "
                 f"{self.model.config.vocab_size}"
@@ -63,6 +63,13 @@ class CheckpointHarnessLM(TemplateLM):  # type: ignore[misc]
         eos_id = self.tokenizer.eos_token_id
         if eos_id is None:
             eos_id = self.checkpoint_state["config"]["data"]["eos_token_id"]
+        configured_eos_id = int(
+            self.checkpoint_state["config"]["data"]["eos_token_id"]
+        )
+        if int(eos_id) != configured_eos_id:
+            raise ValueError(
+                f"tokenizer EOS id is {eos_id}, checkpoint expects {configured_eos_id}"
+            )
         self._eot_token_id = int(eos_id)
 
     @property
@@ -243,4 +250,3 @@ class CheckpointHarnessLM(TemplateLM):  # type: ignore[misc]
                 "generate_until", (context, generation_kwargs), text
             )
         return results
-

@@ -19,7 +19,11 @@ from dmoe.checkpoint import (
     save_checkpoint,
 )
 from dmoe.config import ExperimentConfig, load_experiment_config
-from dmoe.data import RandomTokenBatcher, sequential_token_batches
+from dmoe.data import (
+    RandomTokenBatcher,
+    sequential_token_batches,
+    validate_data_manifest,
+)
 from dmoe.distributed import (
     DistributedContext,
     all_reduce_sum,
@@ -152,6 +156,20 @@ def main() -> None:
     config = load_experiment_config(args.config, args.override)
     context = initialize_distributed()
     seed_everything(config.train.seed, 0)
+
+    if config.data.manifest_path:
+        manifest = validate_data_manifest(
+            config.data.manifest_path,
+            vocab_size=config.model.vocab_size,
+            eos_token_id=config.data.eos_token_id,
+            binary_dtype=config.data.binary_dtype,
+        )
+        if context.is_main:
+            tokenizer = manifest["tokenizer"]
+            print(
+                "validated token data manifest: "
+                f"{tokenizer['source']}@{tokenizer['revision']}"
+            )
 
     if context.device.type != "cuda" and context.is_main:
         print("warning: CUDA is unavailable; this run will use CPU")

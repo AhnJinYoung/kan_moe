@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 from pathlib import Path
 
@@ -63,6 +64,18 @@ def main() -> None:
     )
     if results is None:
         return
+    manifest_path = Path(args.tokenizer).resolve().parent / "manifest.json"
+    tokenizer_manifest = None
+    if manifest_path.is_file():
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            tokenizer_manifest = json.load(handle).get("tokenizer")
+    results["dmoe_metadata"] = {
+        "model": model.get_model_info(),
+        "tokenizer_path": str(Path(args.tokenizer).resolve()),
+        "tokenizer_manifest": tokenizer_manifest,
+        "lm_eval_version": importlib.metadata.version("lm-eval"),
+        "transformers_version": importlib.metadata.version("transformers"),
+    }
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as handle:
@@ -74,4 +87,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

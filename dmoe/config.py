@@ -11,7 +11,7 @@ import yaml
 @dataclass
 class ModelConfig:
     model_type: str = "distributional_moe"
-    vocab_size: int = 32_000
+    vocab_size: int = 32_768
     max_seq_len: int = 2_048
     n_layers: int = 12
     d_model: int = 768
@@ -87,8 +87,9 @@ class DataConfig:
     train_glob: str = "*.bin,*.npy"
     validation_glob: str = "*.bin,*.npy"
     binary_dtype: str = "uint16"
-    eos_token_id: int = 0
+    eos_token_id: int = 2
     tokenizer_path: str = ""
+    manifest_path: str = ""
     validate_token_ids: bool = True
 
     def validate(self) -> None:
@@ -207,4 +208,3 @@ def load_experiment_config(
     for override in overrides or []:
         _apply_override(raw, override)
     return ExperimentConfig.from_dict(raw)
-

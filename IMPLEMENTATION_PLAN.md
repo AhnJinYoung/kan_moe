@@ -13,8 +13,8 @@ parameters:
    distribution and combines those distributions before mapping back to the
    transformer residual stream.
 
-The three models use the same tokenizer, attention, embedding, normalization,
-training data order, optimizer, and token budget. Their total parameter counts
+The three models use the same tokenizer, attention design, embedding design,
+normalization, micro/global batch, training data order, optimizer, and token budget. Their total parameter counts
 must differ by less than 5%; the selected dimensions below make the difference
 less than 0.02%. `top_k` is a runtime/configuration choice in `[1, 16]` and does
 not change the number of model parameters.
@@ -31,7 +31,8 @@ embeddings, and SwiGLU FFNs.
 
 | field | value |
 |---|---:|
-| vocabulary | 32,000 (configurable, must match the prepared data tokenizer) |
+| tokenizer | `mistralai/Mistral-7B-v0.3`, exact revision pinned |
+| vocabulary | 32,768 |
 | layers | 12 |
 | model width | 768 |
 | attention heads | 12 |
@@ -62,8 +63,9 @@ For the dense model, choosing width 16,320 gives
 =451{,}215{,}360
 \]
 
-FFN parameters. Embedding and attention add about 52.9M parameters, producing
-about 504.2M parameters for every variant. MoE routers add only 73,728
+FFN parameters. Embedding and attention add about 53.5M parameters, producing
+504,711,936 dense parameters and 504,785,664 parameters for either MoE.
+MoE routers add only 73,728
 parameters, a difference far below 0.02%.
 
 Total parameters are matched, but active compute deliberately differs. An MoE
@@ -73,8 +75,8 @@ model activates approximately
 52.9\mathrm{M}+6(4.424\mathrm{M})+6k(4.424\mathrm{M})
 \]
 
-parameters per token: about 106M, 133M, 186M, 292M, and 504M for top-k 1, 2,
-4, 8, and 16 respectively. The dense baseline activates all 504M. We will report
+parameters per token: about 107M, 133M, 186M, 292M, and 505M for top-k 1, 2,
+4, 8, and 16 respectively. The dense baseline activates all 505M. We will report
 both quality versus tokens and quality versus wall-clock/FLOPs so total-parameter
 matching is not confused with compute matching.
 
@@ -252,11 +254,28 @@ basis order meaningfully and has greater kernel/memory overhead.
 - We log expert load, router entropy, maximum load fraction, distribution
   entropy, and the norm of the nonlinear correction.
 
-## 6. Data contract
+## 6. Tokenizer and data contract
 
-FineWeb-Edu `sample-100BT` is assumed to be locally prepared and tokenized with
-the same tokenizer used for benchmark evaluation. The training loader will
-accept directories or globs containing:
+All three variants use the **base** tokenizer from
+`mistralai/Mistral-7B-v0.3`, pinned to Hugging Face revision
+`caa1feb0e54d415e2df31207e5f4e273e33509b1`. This replaces the preliminary
+GPT-2 tokenizer choice. The 32,768-token vocabulary is a deliberate compromise:
+it is a modern, public tokenizer while avoiding the very
+large embedding/LM-head allocation that a 100K+ vocabulary would impose on a
+500M-parameter model. Raw pretraining text is encoded without a chat template,
+BOS, padding, or tokenizer-added special tokens. One EOS token (id 2) is added
+after every document.
+
+`prepare_fineweb.py` streams the parquet files in
+`/data/umoe_mod_share/fineweb_edu_100bt/sample/100BT`. Files are sorted
+lexicographically; the last whole parquet file is held out for validation and
+all remaining files form the training split. A file-level split prevents an
+individual document from appearing in both splits. The script saves a local
+tokenizer snapshot and a manifest containing the exact tokenizer revision,
+vocabulary and special-token ids, source files, split assignment, and per-shard
+document/token counts.
+
+The training loader accepts directories or globs containing:
 
 - flat `uint16`/`uint32` `.bin` token shards; or
 - one-dimensional integer `.npy` token shards.
@@ -267,9 +286,10 @@ independent deterministic random streams for training; PPL evaluation assigns
 non-overlapping sequential windows by rank. Raw 100BT text is intentionally not
 tokenized online in the training loop.
 
-The configured vocabulary size, token dtype, EOS id, and tokenizer vocabulary
-must agree. Startup validation will fail early when observed token ids exceed
-the model vocabulary.
+The configured vocabulary size, token dtype, EOS id, and manifest must agree.
+Training validates this contract at startup and also samples every shard for
+out-of-range token ids. Raw 100BT text is never tokenized online in the training
+loop.
 
 ## 7. Training implementation
 
@@ -353,3 +373,8 @@ Top-k=1 tests representation equivalence but cannot test aggregation. Quality
 will be reported against tokens, active-parameter estimates, measured
 tokens/second, and wall-clock time. Wasserstein and learned `rho` are enabled
 only after the fixed, closed-form comparisons are stable.
+
+All primary runs use the same 5B-token budget (9,537 optimizer steps at the
+configured four-GPU global batch of 524,288 tokens), data split, seed, and
+schedule. Before those runs, a 100M-token pipeline pilot and 300M-token top-k
+screen are used to eliminate broken or numerically unstable configurations.

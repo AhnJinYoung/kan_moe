@@ -1,13 +1,44 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 import numpy as np
 
-from dmoe.data import RandomTokenBatcher, sequential_token_batches
+from dmoe.data import (
+    RandomTokenBatcher,
+    sequential_token_batches,
+    validate_data_manifest,
+)
 
 
 class DataTest(unittest.TestCase):
+    def test_manifest_contract_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "manifest.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "dtype": "uint16",
+                        "tokenizer": {"vocab_size": 32_768, "eos_token_id": 2},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            validate_data_manifest(
+                str(path),
+                vocab_size=32_768,
+                eos_token_id=2,
+                binary_dtype="uint16",
+            )
+            with self.assertRaisesRegex(ValueError, "vocab_size"):
+                validate_data_manifest(
+                    str(path),
+                    vocab_size=32_000,
+                    eos_token_id=2,
+                    binary_dtype="uint16",
+                )
+
     def test_random_and_sequential_binary_loading(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -42,4 +73,3 @@ class DataTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

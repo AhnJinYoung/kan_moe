@@ -1,6 +1,6 @@
 model:
   model_type: dense
-  vocab_size: 32000
+  vocab_size: 32768
   max_seq_len: 2048
   n_layers: 12
   d_model: 768
@@ -13,23 +13,24 @@ model:
   gradient_checkpointing: true
 
 data:
-  train_path: /path/to/fineweb-edu-sample-100BT/train
-  validation_path: /path/to/fineweb-edu-sample-100BT/validation
-  train_glob: "*.bin,*.npy"
-  validation_glob: "*.bin,*.npy"
+  train_path: /data/umoe_mod_share/fineweb_edu_100bt/tokenized_mistral_v3/train
+  validation_path: /data/umoe_mod_share/fineweb_edu_100bt/tokenized_mistral_v3/validation
+  train_glob: "*.bin"
+  validation_glob: "*.bin"
   binary_dtype: uint16
-  eos_token_id: 0
-  tokenizer_path: /path/to/tokenizer
+  eos_token_id: 2
+  tokenizer_path: /data/umoe_mod_share/fineweb_edu_100bt/tokenized_mistral_v3/tokenizer
+  manifest_path: /data/umoe_mod_share/fineweb_edu_100bt/tokenized_mistral_v3/manifest.json
   validate_token_ids: true
 
 train:
-  output_dir: outputs/dense_500m
+  output_dir: /data/umoe_mod_share/kan_moe/outputs/dense_500m
   seed: 1337
   sequence_length: 2048
-  micro_batch_size: 1
-  gradient_accumulation_steps: 64
+  micro_batch_size: 2
+  gradient_accumulation_steps: 32
   max_steps: 10000
-  max_tokens: 0
+  max_tokens: 5000000000
   learning_rate: 0.0003
   min_learning_rate: 0.00003
   warmup_steps: 200
@@ -45,4 +46,3 @@ train:
   eval_batches: 50
   save_interval: 500
   keep_last_checkpoints: 3
-

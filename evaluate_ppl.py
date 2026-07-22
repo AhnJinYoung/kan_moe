@@ -93,8 +93,13 @@ def main() -> None:
     nll = (total[0] / total[1].clamp_min(1)).item()
     result = {
         "checkpoint": str(Path(args.checkpoint).resolve()),
+        "checkpoint_step": checkpoint.get("step"),
+        "training_tokens_seen": checkpoint.get("tokens_seen"),
+        "model_type": model.config.model_type,
         "data_path": data_path,
         "top_k": model.config.top_k,
+        "aggregation": model.config.aggregation,
+        **model.parameter_report(),
         "tokens": int(total[1].item()),
         "mean_nll": nll,
         "perplexity": math.exp(min(nll, 50.0)),
@@ -113,4 +118,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -1,125 +1,84 @@
 # Distributional MoE
 
-This repository compares parameter-matched 504M dense, vanilla sparse-MoE,
-and distribution-valued sparse-MoE decoder language models. Read
-[`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) for the mathematical design,
-equivalence controls, and experiment contract.
+This repository compares parameter-matched ~505M dense, vanilla sparse-MoE,
+and distribution-valued sparse-MoE decoder language models. Both MoE variants
+have 16 experts and configurable top-k routing. See
+[`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) for the mathematical design
+and [`RUN_MANUAL.md`](RUN_MANUAL.md) for the exact A100/FineWeb-Edu commands.
 
-## Installation
+## Tokenizer and data
 
-```bash
-python -m pip install -e '.[eval,logging,dev]'
-```
+The experiment uses the base `mistralai/Mistral-7B-v0.3` tokenizer at pinned
+revision `caa1feb0e54d415e2df31207e5f4e273e33509b1` (32,768 tokens). It does not
+use the GPT-2 tokenizer. Every raw document is encoded without automatically
+added special tokens and followed by EOS id 2.
 
-Training only requires PyTorch, NumPy, and PyYAML. Standard benchmark evaluation
-also requires `transformers`, `datasets`, and `lm-evaluation-harness`.
-
-## Prepared FineWeb-Edu format
-
-The loader consumes tokenized one-dimensional `.bin` or `.npy` shards. For a
-`.bin` shard, set `data.binary_dtype` to its actual dtype (`uint16` is appropriate
-only when every token id is below 65,536). Example layout:
-
-```text
-/data/fineweb-edu-sample-100BT/
-  train/
-    train_00000.bin
-    train_00001.bin
-  validation/
-    validation_00000.bin
-  tokenizer/
-    tokenizer.json
-    tokenizer_config.json
-```
-
-Edit the paths, tokenizer vocabulary size, and EOS id in each YAML before
-training. Online tokenization of 100BT raw text is intentionally not performed.
-
-## Verify parameter matching
+Prepare the local parquet corpus once:
 
 ```bash
-python scripts/count_parameters.py \
+python3 prepare_fineweb.py \
+  --input-dir /data/umoe_mod_share/fineweb_edu_100bt/sample/100BT \
+  --output-dir /data/umoe_mod_share/fineweb_edu_100bt/tokenized_mistral_v3 \
+  --workers 16
+```
+
+The process is streaming, restartable at shard granularity, and writes a
+manifest checked by `train.py`. The token files are flat `uint16` arrays and
+can be memory-mapped without loading the corpus into RAM.
+
+## Installation and verification
+
+```bash
+python3 -m pip install -e '.[data,eval,logging,dev]'
+python3 -m unittest discover -s tests -v
+python3 scripts/count_parameters.py \
   configs/dense_500m.yaml \
   configs/vanilla_moe_500m.yaml \
   configs/distributional_moe_500m.yaml
 ```
 
-Expected totals are 504,122,112 parameters for dense and 504,195,840 for each
-MoE model.
+Expected totals are 504,711,936 parameters for dense and 504,785,664 for each
+MoE model, a difference of about 0.015%.
 
 ## Training
-
-Run on four local GPUs:
 
 ```bash
 torchrun --standalone --nproc_per_node=4 train.py \
   --config configs/distributional_moe_500m.yaml
 ```
 
-Change top-k without changing parameters:
+Change top-k without changing the parameter count:
 
 ```bash
 torchrun --standalone --nproc_per_node=4 train.py \
   --config configs/distributional_moe_500m.yaml \
   --override model.top_k=4 \
-  --override train.output_dir=outputs/distributional_moe_500m_k4
+  --override train.output_dir=/data/umoe_mod_share/kan_moe/outputs/distributional_moe_500m_k4
 ```
 
-Aggregation controls use the same model:
+Available distributional aggregators are `geometric` (exact vanilla-equivalent
+control), `hellinger` (primary), `arithmetic`, general `power`, and optional
+`wasserstein`. Set them with `--override model.aggregation=...`; general power
+pooling also accepts `--override model.power_rho=0.75`.
 
-```bash
-# Exact vanilla-equivalent negative control in ILR coordinates
---override model.aggregation=geometric
+## Evaluation
 
-# Hellinger proposal
---override model.aggregation=hellinger
-
-# Arithmetic distribution pool
---override model.aggregation=arithmetic
-
-# General power pool
---override model.aggregation=power --override model.power_rho=0.75
-```
-
-Resume the newest retained checkpoint by setting `train.resume=latest`. Use
-`train.max_tokens` for a token budget; when it is nonzero, training stops at the
-smaller of the token-derived step count and `train.max_steps`.
-
-## Perplexity
+Perplexity is computed over disjoint held-out token windows:
 
 ```bash
 torchrun --standalone --nproc_per_node=4 evaluate_ppl.py \
-  --checkpoint outputs/distributional_moe_500m_k2/step_00010000.pt \
+  --checkpoint /path/to/step_00009537.pt \
   --max-tokens 10000000 \
-  --output outputs/distributional_moe_500m_k2/ppl.json
+  --output /path/to/ppl.json
 ```
 
-Use `--top-k` to evaluate the same checkpoint with another number of active
-experts. This is useful diagnostically, but the primary comparison should use
-the top-k on which the model was trained.
-
-## Standard benchmarks
+Standard benchmarks use the pinned `lm-evaluation-harness` adapter:
 
 ```bash
-python evaluate_harness.py \
-  --checkpoint outputs/distributional_moe_500m_k2/step_00010000.pt \
-  --tokenizer /data/fineweb-edu-sample-100BT/tokenizer \
+python3 evaluate_harness.py \
+  --checkpoint /path/to/step_00009537.pt \
+  --tokenizer /data/umoe_mod_share/fineweb_edu_100bt/tokenized_mistral_v3/tokenizer \
   --tasks mmlu,arc_easy,arc_challenge,hellaswag,piqa,winogrande,openbookqa,boolq,lambada_openai \
   --batch-size 8 \
-  --output outputs/distributional_moe_500m_k2/benchmarks.json
+  --output /path/to/benchmarks.json
 ```
-
-The adapter implements continuation log-likelihood, rolling log-likelihood,
-and greedy generation. Benchmark task data and prompts are managed by
-`lm-evaluation-harness`; keep its version fixed across model comparisons.
-
-## Tests
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-The tests include the exact geometric/vanilla output and gradient equivalence,
-top-1 identity, Hellinger nonlinearity, data shard loading, forward/backward,
-and the 500M parameter-count contract.
-
