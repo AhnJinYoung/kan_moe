@@ -1,0 +1,48 @@
+model:
+  model_type: dense
+  vocab_size: 32000
+  max_seq_len: 2048
+  n_layers: 12
+  d_model: 768
+  n_heads: 12
+  ffn_dim: 16320
+  n_experts: 16
+  top_k: 2
+  moe_layers: []
+  dropout: 0.0
+  gradient_checkpointing: true
+
+data:
+  train_path: /path/to/fineweb-edu-sample-100BT/train
+  validation_path: /path/to/fineweb-edu-sample-100BT/validation
+  train_glob: "*.bin,*.npy"
+  validation_glob: "*.bin,*.npy"
+  binary_dtype: uint16
+  eos_token_id: 0
+  tokenizer_path: /path/to/tokenizer
+  validate_token_ids: true
+
+train:
+  output_dir: outputs/dense_500m
+  seed: 1337
+  sequence_length: 2048
+  micro_batch_size: 1
+  gradient_accumulation_steps: 64
+  max_steps: 10000
+  max_tokens: 0
+  learning_rate: 0.0003
+  min_learning_rate: 0.00003
+  warmup_steps: 200
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+  precision: bf16
+  use_tf32: true
+  compile_model: false
+  log_interval: 10
+  eval_interval: 500
+  eval_batches: 50
+  save_interval: 500
+  keep_last_checkpoints: 3
+

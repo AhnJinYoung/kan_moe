@@ -1,0 +1,11 @@
+numpy>=1.24
+PyYAML>=6.0
+torch>=2.2
+
+# Evaluation and tokenizer integration
+datasets>=2.18
+lm-eval==0.4.12
+transformers>=4.40
+
+# Optional experiment logging
+wandb>=0.17

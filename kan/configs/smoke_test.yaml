@@ -1,0 +1,47 @@
+model:
+  model_type: distributional_moe
+  vocab_size: 101
+  max_seq_len: 32
+  n_layers: 2
+  d_model: 32
+  n_heads: 4
+  ffn_dim: 64
+  n_experts: 4
+  top_k: 2
+  moe_layers: [1]
+  distribution_k: 5
+  aggregation: hellinger
+  dropout: 0.0
+  gradient_checkpointing: false
+
+data:
+  train_path: /tmp/dmoe_smoke/train
+  validation_path: /tmp/dmoe_smoke/validation
+  train_glob: "*.bin"
+  validation_glob: "*.bin"
+  binary_dtype: uint16
+  eos_token_id: 0
+  tokenizer_path: ""
+  validate_token_ids: true
+
+train:
+  output_dir: /tmp/dmoe_smoke/output
+  seed: 123
+  sequence_length: 16
+  micro_batch_size: 2
+  gradient_accumulation_steps: 1
+  max_steps: 2
+  learning_rate: 0.001
+  min_learning_rate: 0.0001
+  warmup_steps: 1
+  weight_decay: 0.01
+  grad_clip: 1.0
+  precision: fp32
+  use_tf32: false
+  compile_model: false
+  log_interval: 1
+  eval_interval: 1
+  eval_batches: 2
+  save_interval: 1
+  keep_last_checkpoints: 2
+

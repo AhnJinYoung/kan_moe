@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "distributional-moe"
+version = "0.1.0"
+description = "Parameter-matched dense, vanilla MoE, and distributional MoE language models"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "PyYAML>=6.0",
+  "torch>=2.2",
+]
+
+[project.optional-dependencies]
+eval = [
+  "datasets>=2.18",
+  "lm-eval==0.4.12",
+  "transformers>=4.40",
+]
+logging = ["wandb>=0.17"]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+include = ["dmoe*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
