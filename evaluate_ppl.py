@@ -5,11 +5,12 @@ import json
 import math
 import time
 from pathlib import Path
+from typing import Iterator
 
 import torch
 
 from dmoe.checkpoint import load_model_from_checkpoint
-from dmoe.data import sequential_token_batches
+from dmoe.data import load_parquet_text_corpus, sequential_token_batches
 from dmoe.distributed import (
     all_reduce_sum,
     cleanup_distributed,
@@ -65,8 +66,44 @@ def main() -> None:
     total = torch.zeros(2, dtype=torch.float64, device=context.device)
     start_time = time.perf_counter()
     model.eval()
-    with torch.inference_mode():
-        for input_ids, labels in sequential_token_batches(
+    data_metadata = None
+    if data_config.get("input_format", "binary") == "parquet_text":
+        data_path = args.data_path or data_config["train_path"]
+        data_glob = args.data_glob or data_config["train_glob"]
+        corpus = load_parquet_text_corpus(
+            path=data_path,
+            patterns=data_glob,
+            tokenizer_path=data_config["tokenizer_path"],
+            tokenizer_revision=data_config.get("tokenizer_revision", ""),
+            text_column=data_config.get("text_column", "text"),
+            cache_dir=data_config.get("hf_cache_dir", ""),
+            dataset_num_proc=int(data_config.get("dataset_num_proc", 16)),
+            tokenizer_batch_size=int(data_config.get("tokenizer_batch_size", 64)),
+            validation_rows=int(data_config.get("validation_rows", 10_000)),
+            vocab_size=model.config.vocab_size,
+            eos_token_id=int(data_config["eos_token_id"]),
+            validate_token_ids=bool(data_config.get("validate_token_ids", True)),
+        )
+        online_batcher = corpus.validation_batcher(
+            sequence_length=sequence_length,
+            batch_size=args.batch_size,
+            rank=context.rank,
+            world_size=context.world_size,
+        )
+        data_metadata = corpus.metadata
+
+        def evaluation_batches() -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+            yielded = 0
+            while max_batches <= 0 or yielded < max_batches:
+                try:
+                    yield online_batcher.next_batch()
+                except StopIteration:
+                    return
+                yielded += 1
+
+        batches = evaluation_batches()
+    else:
+        batches = sequential_token_batches(
             path=data_path,
             patterns=data_glob,
             binary_dtype=binary_dtype,
@@ -75,7 +112,9 @@ def main() -> None:
             rank=context.rank,
             world_size=context.world_size,
             max_batches=max_batches,
-        ):
+        )
+    with torch.inference_mode():
+        for input_ids, labels in batches:
             input_ids = input_ids.to(context.device, non_blocking=True)
             labels = labels.to(context.device, non_blocking=True)
             autocast = (
@@ -97,6 +136,7 @@ def main() -> None:
         "training_tokens_seen": checkpoint.get("tokens_seen"),
         "model_type": model.config.model_type,
         "data_path": data_path,
+        "data_metadata": data_metadata,
         "top_k": model.config.top_k,
         "aggregation": model.config.aggregation,
         **model.parameter_report(),

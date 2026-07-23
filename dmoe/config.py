@@ -82,6 +82,7 @@ class ModelConfig:
 
 @dataclass
 class DataConfig:
+    input_format: str = "binary"
     train_path: str = "data/fineweb_edu/train"
     validation_path: str = "data/fineweb_edu/validation"
     train_glob: str = "*.bin,*.npy"
@@ -89,14 +90,33 @@ class DataConfig:
     binary_dtype: str = "uint16"
     eos_token_id: int = 2
     tokenizer_path: str = ""
+    tokenizer_revision: str = ""
     manifest_path: str = ""
     validate_token_ids: bool = True
+    text_column: str = "text"
+    hf_cache_dir: str = ""
+    dataset_num_proc: int = 16
+    tokenizer_batch_size: int = 64
+    validation_rows: int = 10_000
 
     def validate(self) -> None:
+        if self.input_format not in {"binary", "parquet_text"}:
+            raise ValueError("input_format must be binary or parquet_text")
         if self.binary_dtype not in {"uint16", "uint32", "int32", "int64"}:
             raise ValueError(f"unsupported binary_dtype: {self.binary_dtype}")
         if self.eos_token_id < 0:
             raise ValueError("eos_token_id must be non-negative")
+        if self.input_format == "parquet_text":
+            if not self.tokenizer_path:
+                raise ValueError("tokenizer_path is required for parquet_text input")
+            if not self.text_column:
+                raise ValueError("text_column must be non-empty")
+            if self.dataset_num_proc <= 0 or self.tokenizer_batch_size <= 0:
+                raise ValueError(
+                    "dataset_num_proc and tokenizer_batch_size must be positive"
+                )
+            if self.validation_rows <= 0:
+                raise ValueError("validation_rows must be positive")
 
 
 @dataclass

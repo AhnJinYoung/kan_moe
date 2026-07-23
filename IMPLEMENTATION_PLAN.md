@@ -31,8 +31,8 @@ embeddings, and SwiGLU FFNs.
 
 | field | value |
 |---|---:|
-| tokenizer | `mistralai/Mistral-7B-v0.3`, exact revision pinned |
-| vocabulary | 32,768 |
+| tokenizer | local Llama 2 tokenizer snapshot |
+| vocabulary | 32,000 |
 | layers | 12 |
 | model width | 768 |
 | attention heads | 12 |
@@ -64,7 +64,7 @@ For the dense model, choosing width 16,320 gives
 \]
 
 FFN parameters. Embedding and attention add about 53.5M parameters, producing
-504,711,936 dense parameters and 504,785,664 parameters for either MoE.
+504,122,112 dense parameters and 504,195,840 parameters for either MoE.
 MoE routers add only 73,728
 parameters, a difference far below 0.02%.
 
@@ -256,40 +256,30 @@ basis order meaningfully and has greater kernel/memory overhead.
 
 ## 6. Tokenizer and data contract
 
-All three variants use the **base** tokenizer from
-`mistralai/Mistral-7B-v0.3`, pinned to Hugging Face revision
-`caa1feb0e54d415e2df31207e5f4e273e33509b1`. This replaces the preliminary
-GPT-2 tokenizer choice. The 32,768-token vocabulary is a deliberate compromise:
-it is a modern, public tokenizer while avoiding the very
-large embedding/LM-head allocation that a 100K+ vocabulary would impose on a
-500M-parameter model. Raw pretraining text is encoded without a chat template,
-BOS, padding, or tokenizer-added special tokens. One EOS token (id 2) is added
-after every document.
+All three variants use the same local Llama 2 tokenizer snapshot with a
+32,000-token vocabulary and EOS id 2. Raw pretraining text is encoded without a
+chat template, BOS, padding, or tokenizer-added special tokens. One EOS token is
+added after every document.
 
-`prepare_fineweb.py` streams the parquet files in
-`/data/umoe_mod_share/fineweb_edu_100bt/sample/100BT`. Files are sorted
-lexicographically; the last whole parquet file is held out for validation and
-all remaining files form the training split. A file-level split prevents an
-individual document from appearing in both splits. The script saves a local
-tokenizer snapshot and a manifest containing the exact tokenizer revision,
-vocabulary and special-token ids, source files, split assignment, and per-shard
-document/token counts.
+The primary input path is the local Parquet corpus at
+`/data/umoe_mod_share/fineweb_edu_100bt/sample/100BT`. The loader uses
+`load_dataset("parquet")` and the effective `HF_DATASETS_CACHE`, matching the
+previous UMoE training path. That cache contains raw-text Arrow data rather than
+tokenized training samples. A fast tokenizer therefore encodes documents online
+in batches and continuously packs the resulting stream into 2,048-token
+examples.
 
-The training loader accepts directories or globs containing:
+Rows are consumed in deterministic dataset order. Distributed ranks take
+disjoint strided rows, and all three model variants receive the same rank-local
+stream. The final 10,000 rows are excluded from training and reserved for
+validation. Checkpoints store the next row, epoch, and unconsumed packed-token
+buffer, so resume reproduces the exact subsequent token batch.
 
-- flat `uint16`/`uint32` `.bin` token shards; or
-- one-dimensional integer `.npy` token shards.
-
-Train and validation files are selected using configurable glob patterns. Every
-sample is a contiguous `sequence_length + 1` window. Distributed ranks use
-independent deterministic random streams for training; PPL evaluation assigns
-non-overlapping sequential windows by rank. Raw 100BT text is intentionally not
-tokenized online in the training loop.
-
-The configured vocabulary size, token dtype, EOS id, and manifest must agree.
-Training validates this contract at startup and also samples every shard for
-out-of-range token ids. Raw 100BT text is never tokenized online in the training
-loop.
+Startup validates tokenizer vocabulary/EOS compatibility and every produced
+token id. `runtime.json` and W&B record the sorted Parquet sources, Dataset
+fingerprint, actual Arrow cache filenames, tokenizer contract, split boundary,
+and packing policy. The older `.bin`/`.npy` loader remains available as the
+`binary` input format.
 
 ## 7. Training implementation
 
@@ -374,7 +364,8 @@ will be reported against tokens, active-parameter estimates, measured
 tokens/second, and wall-clock time. Wasserstein and learned `rho` are enabled
 only after the fixed, closed-form comparisons are stable.
 
-All primary runs use the same 5B-token budget (9,537 optimizer steps at the
-configured four-GPU global batch of 524,288 tokens), data split, seed, and
-schedule. Before those runs, a 100M-token pipeline pilot and 300M-token top-k
-screen are used to eliminate broken or numerically unstable configurations.
+All primary runs use the same 5B-token budget, data split, seed, and schedule.
+This is 38,147 optimizer steps on one GPU (131,072 tokens/step) or 9,537 steps
+on four GPUs (524,288 tokens/step). Before those runs, a 100M-token pipeline
+pilot and 300M-token top-k screen are used to eliminate broken or numerically
+unstable configurations.

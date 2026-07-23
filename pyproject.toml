@@ -15,6 +15,7 @@ dependencies = [
 
 [project.optional-dependencies]
 data = [
+  "datasets>=2.18",
   "pyarrow>=15.0",
   "sentencepiece>=0.2",
   "transformers==4.57.1",

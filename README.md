@@ -8,23 +8,18 @@ and [`RUN_MANUAL.md`](RUN_MANUAL.md) for the exact A100/FineWeb-Edu commands.
 
 ## Tokenizer and data
 
-The experiment uses the base `mistralai/Mistral-7B-v0.3` tokenizer at pinned
-revision `caa1feb0e54d415e2df31207e5f4e273e33509b1` (32,768 tokens). It does not
-use the GPT-2 tokenizer. Every raw document is encoded without automatically
-added special tokens and followed by EOS id 2.
+The main configs use the local Llama 2 tokenizer at
+`/data/umoe_mod_share/kan_moe/llama2_tokenizer` (32,000 tokens, EOS id 2).
+`train.py` loads the local FineWeb-Edu Parquet files through Hugging Face
+Datasets, reuses the raw-text Arrow files under `HF_DATASETS_CACHE`, and
+tokenizes/continuously packs text online. It does not require a separate
+tokenized `.bin` corpus. Automatic special tokens are disabled and one EOS is
+appended per document.
 
-Prepare the local parquet corpus once:
-
-```bash
-python3 prepare_fineweb.py \
-  --input-dir /data/umoe_mod_share/fineweb_edu_100bt/sample/100BT \
-  --output-dir /data/umoe_mod_share/fineweb_edu_100bt/tokenized_mistral_v3 \
-  --workers 16
-```
-
-The process is streaming, restartable at shard granularity, and writes a
-manifest checked by `train.py`. The token files are flat `uint16` arrays and
-can be memory-mapped without loading the corpus into RAM.
+The final 10,000 deterministic dataset rows are excluded from training and used
+for validation. The resolved Parquet list, Dataset fingerprint, actual Arrow
+cache filenames, tokenizer contract, and packing policy are written to
+`runtime.json` and W&B.
 
 ## Installation and verification
 
@@ -42,7 +37,7 @@ python3 scripts/count_parameters.py \
   configs/distributional_moe_500m.yaml
 ```
 
-Expected totals are 504,711,936 parameters for dense and 504,785,664 for each
+Expected totals are 504,122,112 parameters for dense and 504,195,840 for each
 MoE model, a difference of about 0.015%.
 
 The explicit cu128 wheel is required on the target server whose NVIDIA driver
@@ -101,7 +96,7 @@ Standard benchmarks use the pinned `lm-evaluation-harness` adapter:
 ```bash
 python3 evaluate_harness.py \
   --checkpoint /path/to/step_00009537.pt \
-  --tokenizer /data/umoe_mod_share/fineweb_edu_100bt/tokenized_mistral_v3/tokenizer \
+  --tokenizer /data/umoe_mod_share/kan_moe/llama2_tokenizer \
   --tasks mmlu,arc_easy,arc_challenge,hellaswag,piqa,winogrande,openbookqa,boolq,lambada_openai \
   --batch-size 8 \
   --output /path/to/benchmarks.json

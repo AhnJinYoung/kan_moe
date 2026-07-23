@@ -39,6 +39,7 @@ from dmoe.checkpoint import (
 from dmoe.config import ExperimentConfig, load_experiment_config
 from dmoe.data import (
     RandomTokenBatcher,
+    load_parquet_text_corpus,
     sequential_token_batches,
     validate_data_manifest,
 )
@@ -133,19 +134,33 @@ def evaluate_validation(
     config: ExperimentConfig,
     context: DistributedContext,
     autocast: Callable[[], contextlib.AbstractContextManager[Any]],
+    online_batcher_factory: Callable[[], Any] | None = None,
 ) -> dict[str, float]:
     model.eval()
     total = torch.zeros(2, dtype=torch.float64, device=context.device)
-    for input_ids, labels in sequential_token_batches(
-        path=config.data.validation_path,
-        patterns=config.data.validation_glob,
-        binary_dtype=config.data.binary_dtype,
-        sequence_length=config.train.sequence_length,
-        batch_size=config.train.micro_batch_size,
-        rank=context.rank,
-        world_size=context.world_size,
-        max_batches=config.train.eval_batches,
-    ):
+    if online_batcher_factory is None:
+        batches = sequential_token_batches(
+            path=config.data.validation_path,
+            patterns=config.data.validation_glob,
+            binary_dtype=config.data.binary_dtype,
+            sequence_length=config.train.sequence_length,
+            batch_size=config.train.micro_batch_size,
+            rank=context.rank,
+            world_size=context.world_size,
+            max_batches=config.train.eval_batches,
+        )
+    else:
+        online_batcher = online_batcher_factory()
+
+        def online_batches() -> Any:
+            for _ in range(config.train.eval_batches):
+                try:
+                    yield online_batcher.next_batch()
+                except StopIteration:
+                    return
+
+        batches = online_batches()
+    for input_ids, labels in batches:
         input_ids = input_ids.to(context.device, non_blocking=True)
         labels = labels.to(context.device, non_blocking=True)
         with autocast():
@@ -216,7 +231,54 @@ def main() -> None:
         ],
     }
 
-    if config.data.manifest_path:
+    online_corpus = None
+    validation_batcher_factory: Callable[[], Any] | None = None
+    if config.data.input_format == "parquet_text":
+        online_corpus = load_parquet_text_corpus(
+            path=config.data.train_path,
+            patterns=config.data.train_glob,
+            tokenizer_path=config.data.tokenizer_path,
+            tokenizer_revision=config.data.tokenizer_revision,
+            text_column=config.data.text_column,
+            cache_dir=config.data.hf_cache_dir,
+            dataset_num_proc=config.data.dataset_num_proc,
+            tokenizer_batch_size=config.data.tokenizer_batch_size,
+            validation_rows=config.data.validation_rows,
+            vocab_size=config.model.vocab_size,
+            eos_token_id=config.data.eos_token_id,
+            validate_token_ids=config.data.validate_token_ids,
+        )
+        runtime_info["data"] = online_corpus.metadata
+        train_batcher = online_corpus.train_batcher(
+            sequence_length=config.train.sequence_length,
+            batch_size=config.train.micro_batch_size,
+            rank=context.rank,
+            world_size=context.world_size,
+        )
+
+        def make_validation_batcher() -> Any:
+            assert online_corpus is not None
+            return online_corpus.validation_batcher(
+                sequence_length=config.train.sequence_length,
+                batch_size=config.train.micro_batch_size,
+                rank=context.rank,
+                world_size=context.world_size,
+            )
+
+        validation_batcher_factory = make_validation_batcher
+        if context.is_main:
+            cache_files = online_corpus.metadata["hf_cache_files"]
+            print(
+                "loaded raw Parquet text through Hugging Face cache: "
+                f"{online_corpus.metadata['total_rows']} rows"
+            )
+            if cache_files:
+                print("HF cache files:")
+                for cache_file in cache_files:
+                    print(f"  {cache_file}")
+            else:
+                print("HF cache_files is empty; the dataset may be held in memory")
+    elif config.data.manifest_path:
         manifest = validate_data_manifest(
             config.data.manifest_path,
             vocab_size=config.model.vocab_size,
@@ -229,6 +291,24 @@ def main() -> None:
                 "validated token data manifest: "
                 f"{tokenizer['source']}@{tokenizer['revision']}"
             )
+        runtime_info["data"] = {
+            "input_format": "binary",
+            "manifest_path": str(Path(config.data.manifest_path).resolve()),
+            "manifest": manifest,
+        }
+
+    if config.data.input_format == "binary":
+        train_batcher = RandomTokenBatcher(
+            path=config.data.train_path,
+            patterns=config.data.train_glob,
+            binary_dtype=config.data.binary_dtype,
+            sequence_length=config.train.sequence_length,
+            batch_size=config.train.micro_batch_size,
+            seed=config.train.seed,
+            rank=context.rank,
+            vocab_size=config.model.vocab_size,
+            validate_token_ids=config.data.validate_token_ids,
+        )
 
     if context.device.type != "cuda" and context.is_main:
         print("warning: CUDA is unavailable; this run will use CPU")
@@ -250,18 +330,6 @@ def main() -> None:
     optimizer = build_optimizer(model, config)
     fp16_enabled = config.train.precision == "fp16" and context.device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=fp16_enabled)
-
-    train_batcher = RandomTokenBatcher(
-        path=config.data.train_path,
-        patterns=config.data.train_glob,
-        binary_dtype=config.data.binary_dtype,
-        sequence_length=config.train.sequence_length,
-        batch_size=config.train.micro_batch_size,
-        seed=config.train.seed,
-        rank=context.rank,
-        vocab_size=config.model.vocab_size,
-        validate_token_ids=config.data.validate_token_ids,
-    )
 
     start_step = 0
     tokens_seen = 0
@@ -398,7 +466,13 @@ def main() -> None:
                 last_logged_tokens = tokens_seen
 
             if config.train.eval_interval > 0 and current_step % config.train.eval_interval == 0:
-                validation = evaluate_validation(raw_model, config, context, autocast)
+                validation = evaluate_validation(
+                    raw_model,
+                    config,
+                    context,
+                    autocast,
+                    validation_batcher_factory,
+                )
                 validation.update({"step": current_step, "tokens_seen": tokens_seen})
                 if context.is_main:
                     print(json.dumps(validation, sort_keys=True))

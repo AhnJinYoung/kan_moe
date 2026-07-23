@@ -5,7 +5,8 @@
 ```text
 code:        /data/umoe_mod_share/kan_moe
 raw parquet: /data/umoe_mod_share/fineweb_edu_100bt/sample/100BT
-tokens:      /data/umoe_mod_share/fineweb_edu_100bt/tokenized_mistral_v3
+HF cache:    $HF_DATASETS_CACHE
+tokenizer:   /data/umoe_mod_share/kan_moe/llama2_tokenizer
 outputs:     /data/umoe_mod_share/kan_moe/outputs
 ```
 
@@ -27,6 +28,10 @@ python3 -m pip install -e '.[data,eval,logging,dev]'
 export HF_HOME=/data/umoe_mod_share/hf_cache
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=8
+
+# 예전 학습에 사용한 값이 이미 설정되어 있다면 바꾸지 않는다.
+echo "HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-<datasets default>}"
+python3 -c 'from datasets.config import HF_DATASETS_CACHE; print("effective cache:", HF_DATASETS_CACHE)'
 ```
 
 CUDA용 PyTorch가 이미 설치된 서버 환경을 전제로 한다. 다음 결과에서
@@ -73,44 +78,52 @@ unset CUDA_VISIBLE_DEVICES
 `DMOE_AUTO_SELECT_GPU=0`을 설정한다. idle 판정의 허용 memory는 기본
 1,024MiB이며 필요하면 `DMOE_GPU_MAX_USED_MEMORY_MIB`로 조정할 수 있다.
 
-## 2. FineWeb-Edu sample-100BT 전처리
+## 2. FineWeb-Edu raw cache와 Llama 2 tokenizer 확인
 
-토큰 데이터는 약 100B tokens x 2 bytes 규모이므로 metadata를 포함해 최소
-약 210GB의 여유 공간을 확보한다.
+별도의 token `.bin` 전처리는 하지 않는다. 과거 코드와 동일하게
+`load_dataset("parquet", cache_dir=HF_DATASETS_CACHE)`가 만든 raw-text Arrow
+cache를 재사용하고, 학습 중 fast Llama 2 tokenizer로 online tokenization과
+continuous packing을 수행한다.
 
 ```bash
-df -h /data/umoe_mod_share
 find /data/umoe_mod_share/fineweb_edu_100bt/sample/100BT \
   -maxdepth 1 -name '*.parquet' -type f | sort | wc -l
+find /data/umoe_mod_share/kan_moe/llama2_tokenizer \
+  -maxdepth 1 -type f | sort
+
+python3 - <<'PY'
+from transformers import AutoTokenizer
+p = "/data/umoe_mod_share/kan_moe/llama2_tokenizer"
+t = AutoTokenizer.from_pretrained(p, use_fast=True, trust_remote_code=False)
+print({"path": p, "vocab_size": len(t), "eos": t.eos_token_id,
+       "bos": t.bos_token_id, "is_fast": t.is_fast})
+assert len(t) == 32000 and t.eos_token_id == 2 and t.is_fast
+PY
 ```
 
-다음 명령은 base Mistral v0.3 tokenizer의 정확한 snapshot을 내려받고,
-문서마다 자동 special token 없이 tokenize한 뒤 EOS(id 2)를 하나 붙인다.
-정렬상 마지막 파일 `006_00005.parquet` 한 개가 validation으로 분리된다.
+tokenizer 디렉터리가 다른 곳에 있다면 먼저 찾고 YAML 또는 override를
+수정한다.
 
 ```bash
-python3 prepare_fineweb.py \
-  --input-dir /data/umoe_mod_share/fineweb_edu_100bt/sample/100BT \
-  --input-glob '*.parquet' \
-  --output-dir /data/umoe_mod_share/fineweb_edu_100bt/tokenized_mistral_v3 \
-  --tokenizer mistralai/Mistral-7B-v0.3 \
-  --tokenizer-revision caa1feb0e54d415e2df31207e5f4e273e33509b1 \
-  --expected-vocab-size 32768 \
-  --text-column text \
-  --dtype uint16 \
-  --validation-files 1 \
-  --batch-size 256 \
-  --workers 16
+find /data/umoe_mod_share -type f \
+  \( -name tokenizer.json -o -name tokenizer.model \) \
+  -path '*llama*tokenizer*' -printf '%h\n' 2>/dev/null | sort -u
 ```
 
-중단 후 같은 명령을 다시 실행하면 metadata와 파일 크기가 일치하는 완료
-shard는 건너뛴다. 의도적으로 다시 만들 때만 `--overwrite`를 추가한다.
-완료 후 계약을 확인한다.
+`HF_DATASETS_CACHE`의 정확한 내부 Arrow 경로는 hash 기반이므로 추측하지
+않는다. `train.py`가 `Dataset.cache_files`를 출력하며 같은 값을
+`runtime.json`에 저장한다. 사전 확인은 다음처럼 할 수 있다.
 
 ```bash
-python3 -c 'import json; p="/data/umoe_mod_share/fineweb_edu_100bt/tokenized_mistral_v3/manifest.json"; d=json.load(open(p)); print(d["tokenizer"]); print(d["validation_files"]); print(d["splits"])'
-du -sh /data/umoe_mod_share/fineweb_edu_100bt/tokenized_mistral_v3
+CACHE=$(python3 -c 'from datasets.config import HF_DATASETS_CACHE; print(HF_DATASETS_CACHE)')
+find "$CACHE" -type f -name '*.arrow' -ipath '*parquet*' \
+  -printf '%s %p\n' 2>/dev/null | sort -nr | head -30
 ```
+
+cache hit가 나더라도 이것은 tokenized cache가 아니라 raw-text Arrow
+cache다. tokenization은 학습 중 수행된다. 모든 비교군은 동일하게 special
+token을 자동 추가하지 않고 문서마다 EOS(id 2)를 하나 붙인다. 전체 Dataset의
+마지막 10,000 rows는 training에서 제외하고 validation에만 사용한다.
 
 ## 3. 코드와 파라미터 검증
 
@@ -122,8 +135,8 @@ python3 scripts/count_parameters.py \
   configs/distributional_moe_500m.yaml
 ```
 
-기대값은 dense `504,711,936`, vanilla MoE와 distributional MoE 각각
-`504,785,664`이다. 두 MoE의 total parameter 수는 정확히 같고, dense와의
+기대값은 dense `504,122,112`, vanilla MoE와 distributional MoE 각각
+`504,195,840`이다. 두 MoE의 total parameter 수는 정확히 같고, dense와의
 차이는 약 0.015%이다.
 
 ## 4. 100M-token 파이프라인 pilot
@@ -187,9 +200,10 @@ done
 ## 6. 5B-token 주 비교
 
 한 번에 하나씩 실행한다. YAML의 기본값은 모두 micro-batch 2/GPU,
-gradient accumulation 32, 5B tokens, seed 1337, global batch 524,288
-tokens이며 최종 step은 9,537이다. micro-batch까지 통일했으므로 rank별
-sampler가 세 모델에 동일한 token window 순서를 공급한다.
+gradient accumulation 32, 5B tokens, seed 1337이다. `max_steps: 0`이므로
+GPU 수와 무관하게 `max_tokens`가 종료 조건이다. 한 GPU에서는 optimizer
+step당 131,072 tokens로 38,147 steps, 네 GPU에서는 524,288 tokens로
+9,537 steps다. 세 모델은 같은 row order와 online packing 규칙을 사용한다.
 
 단일 A100용 micro-batch와 accumulation은 YAML에 설정되어 있다고 가정한다.
 
@@ -252,7 +266,7 @@ CKPT=$(ls -1 "${RUN}"/step_*.pt | sort | tail -n 1)
 
 python3 evaluate_harness.py \
   --checkpoint "${CKPT}" \
-  --tokenizer /data/umoe_mod_share/fineweb_edu_100bt/tokenized_mistral_v3/tokenizer \
+  --tokenizer /data/umoe_mod_share/kan_moe/llama2_tokenizer \
   --tasks mmlu,arc_easy,arc_challenge,hellaswag,piqa,winogrande,openbookqa,boolq,lambada_openai \
   --device cuda:0 \
   --batch-size 8 \
@@ -267,8 +281,9 @@ python3 evaluate_harness.py \
 
 ## 9. 비교 시 반드시 고정·기록할 항목
 
-- tokenizer source와 exact revision, `manifest.json`
-- train/validation source shard 목록
+- local Llama 2 tokenizer 파일과 vocab/EOS 계약
+- raw Parquet 목록, Dataset fingerprint, 실제 `HF_DATASETS_CACHE` Arrow 파일
+- train/validation row 경계와 online packing 정책
 - tokens seen, seed, sequence length, global batch, optimizer schedule
 - total parameters와 top-k별 active parameters
 - PPL token count와 benchmark harness version/task configuration

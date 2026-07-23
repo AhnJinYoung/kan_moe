@@ -1,6 +1,6 @@
 model:
   model_type: vanilla_moe
-  vocab_size: 32768
+  vocab_size: 32000
   max_seq_len: 2048
   n_layers: 12
   d_model: 768
@@ -15,15 +15,22 @@ model:
   gradient_checkpointing: true
 
 data:
-  train_path: /data/umoe_mod_share/fineweb_edu_100bt/tokenized_mistral_v3/train
-  validation_path: /data/umoe_mod_share/fineweb_edu_100bt/tokenized_mistral_v3/validation
-  train_glob: "*.bin"
-  validation_glob: "*.bin"
+  input_format: parquet_text
+  train_path: /data/umoe_mod_share/fineweb_edu_100bt/sample/100BT
+  validation_path: ""
+  train_glob: "*.parquet"
+  validation_glob: "*.parquet"
   binary_dtype: uint16
   eos_token_id: 2
-  tokenizer_path: /data/umoe_mod_share/fineweb_edu_100bt/tokenized_mistral_v3/tokenizer
-  manifest_path: /data/umoe_mod_share/fineweb_edu_100bt/tokenized_mistral_v3/manifest.json
+  tokenizer_path: /data/umoe_mod_share/kan_moe/llama2_tokenizer
+  tokenizer_revision: ""
+  manifest_path: ""
   validate_token_ids: true
+  text_column: text
+  hf_cache_dir: ""
+  dataset_num_proc: 16
+  tokenizer_batch_size: 64
+  validation_rows: 10000
 
 train:
   output_dir: /data/umoe_mod_share/kan_moe/outputs/vanilla_moe_500m_k2
@@ -31,7 +38,7 @@ train:
   sequence_length: 2048
   micro_batch_size: 2
   gradient_accumulation_steps: 32
-  max_steps: 10000
+  max_steps: 0
   max_tokens: 5000000000
   learning_rate: 0.0003
   min_learning_rate: 0.00003

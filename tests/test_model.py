@@ -75,7 +75,7 @@ class ModelTest(unittest.TestCase):
 
     def test_500m_parameter_contract_on_meta_device(self) -> None:
         common = dict(
-            vocab_size=32_768,
+            vocab_size=32_000,
             max_seq_len=2_048,
             n_layers=12,
             d_model=768,
@@ -115,8 +115,8 @@ class ModelTest(unittest.TestCase):
             for model in (dense, vanilla, distributional)
         ]
         self.assertEqual(counts[1], counts[2])
-        self.assertEqual(counts[0], 504_711_936)
-        self.assertEqual(counts[1], 504_785_664)
+        self.assertEqual(counts[0], 504_122_112)
+        self.assertEqual(counts[1], 504_195_840)
         self.assertLess((max(counts) - min(counts)) / min(counts), 0.05)
 
 
