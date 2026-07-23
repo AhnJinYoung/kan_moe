@@ -29,6 +29,11 @@ can be memory-mapped without loading the corpus into RAM.
 ## Installation and verification
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install --upgrade pip
+python3 -m pip install torch==2.11.0 \
+  --index-url https://download.pytorch.org/whl/cu128
 python3 -m pip install -e '.[data,eval,logging,dev]'
 python3 -m unittest discover -s tests -v
 python3 scripts/count_parameters.py \
@@ -39,6 +44,10 @@ python3 scripts/count_parameters.py \
 
 Expected totals are 504,711,936 parameters for dense and 504,785,664 for each
 MoE model, a difference of about 0.015%.
+
+The explicit cu128 wheel is required on the target server whose NVIDIA driver
+supports CUDA 12.8. Installing an unqualified latest PyTorch wheel can select a
+newer CUDA build that this driver cannot initialize.
 
 ## Training
 
@@ -52,14 +61,14 @@ torchrun --standalone --nproc_per_node=4 train.py \
   --config configs/distributional_moe_500m.yaml
 ```
 
-For one A100 while preserving the original effective global batch:
+For one A100 using the batch settings already stored in the YAML:
 
 ```bash
 unset CUDA_VISIBLE_DEVICES
 torchrun --standalone --nproc_per_node=1 train.py \
   --config configs/distributional_moe_500m.yaml \
-  --override train.micro_batch_size=4 \
-  --override train.gradient_accumulation_steps=64
+  --override train.wandb_project=kan-moe \
+  --override train.wandb_run_name=dmoe-hellinger-k2-5b-1gpu
 ```
 
 Change top-k without changing the parameter count:

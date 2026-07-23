@@ -191,7 +191,12 @@ def main() -> None:
     if expects_cuda and not torch.cuda.is_available():
         raise RuntimeError(
             "a CUDA device was selected, but this PyTorch process cannot access "
-            "CUDA. Check the CUDA-enabled PyTorch build and container GPU mapping."
+            "CUDA. This is independent of GPU auto-selection. "
+            f"Installed torch={torch.__version__}, "
+            f"torch.version.cuda={torch.version.cuda!r}. Check the CUDA-enabled "
+            "PyTorch wheel against the NVIDIA driver's supported CUDA version. "
+            "For a driver supporting CUDA 12.8, install torch==2.11.0 from "
+            "https://download.pytorch.org/whl/cu128."
         )
     if GPU_SELECTION.mode == "unavailable" and torch.cuda.is_available():
         raise RuntimeError(
