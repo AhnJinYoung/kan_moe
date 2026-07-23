@@ -48,6 +48,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--router-gradient-batches", type=int, default=8)
     parser.add_argument("--bootstrap-iters", type=int, default=1_000)
     parser.add_argument("--bootstrap-seed", type=int, default=17)
+    parser.add_argument(
+        "--split",
+        choices=("validation", "test"),
+        default="validation",
+    )
     parser.add_argument("--precision", choices=("bf16", "fp16", "fp32"), default="bf16")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--output", default="mechanism_analysis.json")
@@ -232,6 +237,7 @@ def _validate_checkpoint_pair(
         "tokenizer_path",
         "eos_token_id",
         "validation_rows",
+        "test_rows",
     )
     mismatched_data = [
         field
@@ -284,11 +290,17 @@ def _evaluation_batches(
                 RESOURCE_LIMITS.parquet_batch_limit,
             ),
             validation_rows=int(data_config.get("validation_rows", 10_000)),
+            test_rows=int(data_config.get("test_rows", 0)),
             vocab_size=model.config.vocab_size,
             eos_token_id=int(data_config["eos_token_id"]),
             validate_token_ids=bool(data_config.get("validate_token_ids", True)),
         )
-        batcher = corpus.validation_batcher(
+        batcher_factory = (
+            corpus.validation_batcher
+            if args.split == "validation"
+            else corpus.test_batcher
+        )
+        batcher = batcher_factory(
             sequence_length=sequence_length,
             batch_size=args.batch_size,
             rank=0,
@@ -304,6 +316,10 @@ def _evaluation_batches(
 
         return iterator(), corpus.metadata
 
+    if args.split == "test":
+        raise ValueError(
+            "--split test is only supported for parquet_text checkpoints"
+        )
     return (
         sequential_token_batches(
             path=args.data_path or data_config["validation_path"],
@@ -448,6 +464,7 @@ def main() -> None:
         ),
         "tokens": len(disagreement),
         "sequence_blocks": len(block_disagreement_tensor),
+        "evaluation_split": args.split,
         "data_metadata": data_metadata,
         "resource_limits": RESOURCE_LIMITS.to_dict(),
         "model": {

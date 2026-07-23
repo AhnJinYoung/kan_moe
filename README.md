@@ -17,12 +17,13 @@ tokenizes/continuously packs text online. It neither creates a full Hugging Face
 Arrow dataset nor requires a tokenized `.bin` corpus. Automatic special tokens
 are disabled and one EOS is appended per document.
 
-The final 10,000 deterministic dataset rows are excluded from training and used
-for validation. Parquet and tokenizer batches are capped at four documents,
-PyArrow multiprocessing is disabled, and startup detects cgroup CPU/memory
-limits and caps native thread pools to one or two threads. The resolved resource
-limits, Parquet layout, tokenizer contract, and packing policy are written to
-`runtime.json` and W&B.
+The final 20,000 deterministic dataset rows are excluded from training:
+10,000 for validation during model selection and an untouched final 10,000 for
+test after freezing the configuration. Parquet and tokenizer batches are capped
+at four documents, PyArrow multiprocessing is disabled, and startup detects
+cgroup CPU/memory limits and caps native thread pools to one or two threads.
+The resolved resource limits, Parquet layout, tokenizer contract, and packing
+policy are written to `runtime.json` and W&B.
 
 ## Installation and verification
 
@@ -90,11 +91,20 @@ control), `hellinger` (primary), `arithmetic`, general `power`, and optional
 pooling also accepts `--override model.power_rho=0.75`. Layerwise learned rho
 uses `model.aggregation=power` and `model.learnable_rho=true`.
 
-The pre-registered pilot, 150M falsification screen, three-scale curve, and
-three-seed matrix can be inspected without launching jobs:
+The staged protocol first profiles and screens at 500M, then confirms a frozen
+winner from scratch. Learned controls, the 150M/1.5B scale check, and extra
+seeds are deferred until the 500M result passes its gate. Commands can be
+inspected without launching jobs:
 
 ```bash
+python3 scripts/experiment_matrix.py --stage profiling --nproc-per-node 4
+python3 scripts/experiment_matrix.py --stage pilot --nproc-per-node 4
 python3 scripts/experiment_matrix.py --stage screening --nproc-per-node 4
+python3 scripts/experiment_matrix.py \
+  --stage confirmation --confirmation-tokens 1000000000 \
+  --winner-distribution-k 9 --winner-rho 0.5 --winner-top-k 2 \
+  --nproc-per-node 4
+python3 scripts/experiment_matrix.py --stage controls --nproc-per-node 4
 python3 scripts/experiment_matrix.py --stage scaling --nproc-per-node 4
 python3 scripts/experiment_matrix.py --stage seeds --nproc-per-node 4
 ```
@@ -108,6 +118,7 @@ Perplexity is computed over disjoint held-out token windows:
 ```bash
 torchrun --standalone --nproc_per_node=4 evaluate_ppl.py \
   --checkpoint /path/to/step_00009537.pt \
+  --split test \
   --max-tokens 10000000 \
   --output /path/to/ppl.json
 ```
@@ -130,6 +141,7 @@ scale are isolated under `--suite secondary`. Paired mechanism analysis uses:
 python3 analyze_mechanism.py \
   --checkpoint /path/to/distributional.pt \
   --baseline-checkpoint /path/to/same_seed_vanilla.pt \
+  --split test \
   --max-tokens 1000000 \
   --output /path/to/mechanism.json
 ```

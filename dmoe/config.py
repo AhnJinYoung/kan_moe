@@ -121,6 +121,7 @@ class DataConfig:
     dataset_num_proc: int = 1
     tokenizer_batch_size: int = 4
     validation_rows: int = 10_000
+    test_rows: int = 10_000
 
     def validate(self) -> None:
         if self.input_format not in {"binary", "parquet_text"}:
@@ -146,6 +147,8 @@ class DataConfig:
                 )
             if self.validation_rows <= 0:
                 raise ValueError("validation_rows must be positive")
+            if self.test_rows < 0:
+                raise ValueError("test_rows must be non-negative")
 
 
 @dataclass

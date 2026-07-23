@@ -9,6 +9,7 @@ from dmoe.data import (
     PackedTextBatcher,
     ParquetFileLayout,
     ParquetRowStream,
+    ParquetTextCorpus,
     RandomTokenBatcher,
     StreamingPackedTextBatcher,
     sequential_token_batches,
@@ -42,6 +43,36 @@ class _FakeTokenizer:
 
 
 class DataTest(unittest.TestCase):
+    def test_parquet_corpus_reserves_disjoint_validation_and_test_rows(
+        self,
+    ) -> None:
+        dataset = _FakeDataset([chr(ord("a") + index) for index in range(20)])
+        corpus = ParquetTextCorpus(
+            dataset=dataset,
+            tokenizer=_FakeTokenizer(),
+            metadata={},
+            text_column="text",
+            eos_token_id=2,
+            vocab_size=32,
+            tokenizer_batch_size=2,
+            validation_rows=4,
+            test_rows=3,
+            validate_token_ids=True,
+        )
+        train = corpus.train_batcher(
+            sequence_length=2, batch_size=1, rank=0, world_size=1
+        )
+        validation = corpus.validation_batcher(
+            sequence_length=2, batch_size=1, rank=0, world_size=1
+        )
+        test = corpus.test_batcher(
+            sequence_length=2, batch_size=1, rank=0, world_size=1
+        )
+        self.assertEqual(corpus.train_rows, 13)
+        self.assertEqual((train.row_start, train.row_stop), (0, 13))
+        self.assertEqual((validation.row_start, validation.row_stop), (13, 17))
+        self.assertEqual((test.row_start, test.row_stop), (17, 20))
+
     def test_manifest_contract_validation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "manifest.json"

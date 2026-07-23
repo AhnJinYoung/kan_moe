@@ -693,6 +693,7 @@ class DirectParquetTextCorpus:
         tokenizer_batch_size: int,
         parquet_read_batch_size: int,
         validation_rows: int,
+        test_rows: int,
         validate_token_ids: bool,
     ) -> None:
         self.layouts = layouts
@@ -704,17 +705,23 @@ class DirectParquetTextCorpus:
         self.tokenizer_batch_size = tokenizer_batch_size
         self.parquet_read_batch_size = parquet_read_batch_size
         self.validation_rows = validation_rows
+        self.test_rows = test_rows
         self.validate_token_ids = validate_token_ids
         self.total_rows = sum(layout.row_count for layout in layouts)
-        if validation_rows >= self.total_rows:
+        if validation_rows + test_rows >= self.total_rows:
             raise ValueError(
-                f"validation_rows={validation_rows} leaves no training rows "
+                f"validation_rows={validation_rows} and test_rows={test_rows} "
+                "leave no training rows "
                 f"from {self.total_rows} rows"
             )
 
     @property
     def train_rows(self) -> int:
-        return self.total_rows - self.validation_rows
+        return self.total_rows - self.validation_rows - self.test_rows
+
+    @property
+    def test_start(self) -> int:
+        return self.total_rows - self.test_rows
 
     def _batcher(
         self,
@@ -777,6 +784,26 @@ class DirectParquetTextCorpus:
     ) -> StreamingPackedTextBatcher:
         return self._batcher(
             row_start=self.train_rows,
+            row_stop=self.test_start,
+            sequence_length=sequence_length,
+            batch_size=batch_size,
+            rank=rank,
+            world_size=world_size,
+            repeat=False,
+        )
+
+    def test_batcher(
+        self,
+        *,
+        sequence_length: int,
+        batch_size: int,
+        rank: int,
+        world_size: int,
+    ) -> StreamingPackedTextBatcher:
+        if self.test_rows <= 0:
+            raise ValueError("this corpus has no reserved test rows")
+        return self._batcher(
+            row_start=self.test_start,
             row_stop=self.total_rows,
             sequence_length=sequence_length,
             batch_size=batch_size,
@@ -800,11 +827,13 @@ class ParquetTextCorpus:
         vocab_size: int,
         tokenizer_batch_size: int,
         validation_rows: int,
+        test_rows: int,
         validate_token_ids: bool,
     ) -> None:
-        if validation_rows >= len(dataset):
+        if validation_rows + test_rows >= len(dataset):
             raise ValueError(
-                f"validation_rows={validation_rows} leaves no training rows "
+                f"validation_rows={validation_rows} and test_rows={test_rows} "
+                "leave no training rows "
                 f"from a dataset with {len(dataset)} rows"
             )
         self.dataset = dataset
@@ -815,11 +844,16 @@ class ParquetTextCorpus:
         self.vocab_size = vocab_size
         self.tokenizer_batch_size = tokenizer_batch_size
         self.validation_rows = validation_rows
+        self.test_rows = test_rows
         self.validate_token_ids = validate_token_ids
 
     @property
     def train_rows(self) -> int:
-        return len(self.dataset) - self.validation_rows
+        return len(self.dataset) - self.validation_rows - self.test_rows
+
+    @property
+    def test_start(self) -> int:
+        return len(self.dataset) - self.test_rows
 
     def train_batcher(
         self,
@@ -864,6 +898,33 @@ class ParquetTextCorpus:
             batch_size=batch_size,
             tokenizer_batch_size=self.tokenizer_batch_size,
             row_start=self.train_rows,
+            row_stop=self.test_start,
+            rank=rank,
+            world_size=world_size,
+            repeat=False,
+            validate_token_ids=self.validate_token_ids,
+        )
+
+    def test_batcher(
+        self,
+        *,
+        sequence_length: int,
+        batch_size: int,
+        rank: int,
+        world_size: int,
+    ) -> PackedTextBatcher:
+        if self.test_rows <= 0:
+            raise ValueError("this corpus has no reserved test rows")
+        return PackedTextBatcher(
+            dataset=self.dataset,
+            tokenizer=self.tokenizer,
+            text_column=self.text_column,
+            eos_token_id=self.eos_token_id,
+            vocab_size=self.vocab_size,
+            sequence_length=sequence_length,
+            batch_size=batch_size,
+            tokenizer_batch_size=self.tokenizer_batch_size,
+            row_start=self.test_start,
             row_stop=len(self.dataset),
             rank=rank,
             world_size=world_size,
@@ -882,6 +943,7 @@ def _load_direct_parquet_text_corpus(
     tokenizer_batch_size: int,
     parquet_read_batch_size: int,
     validation_rows: int,
+    test_rows: int,
     vocab_size: int,
     eos_token_id: int,
     validate_token_ids: bool,
@@ -915,9 +977,10 @@ def _load_direct_parquet_text_corpus(
             )
         )
     total_rows = sum(layout.row_count for layout in layouts)
-    if validation_rows >= total_rows:
+    if validation_rows + test_rows >= total_rows:
         raise ValueError(
-            f"validation_rows={validation_rows} leaves no training rows "
+            f"validation_rows={validation_rows} and test_rows={test_rows} "
+            "leave no training rows "
             f"from {total_rows} rows"
         )
     corpus_metadata: dict[str, object] = {
@@ -933,8 +996,9 @@ def _load_direct_parquet_text_corpus(
             for layout in layouts
         ],
         "total_rows": total_rows,
-        "train_rows": total_rows - validation_rows,
+        "train_rows": total_rows - validation_rows - test_rows,
         "validation_rows": validation_rows,
+        "test_rows": test_rows,
         "text_column": text_column,
         "tokenizer_batch_size": tokenizer_batch_size,
         "parquet_read_batch_size": parquet_read_batch_size,
@@ -961,6 +1025,7 @@ def _load_direct_parquet_text_corpus(
         tokenizer_batch_size=tokenizer_batch_size,
         parquet_read_batch_size=parquet_read_batch_size,
         validation_rows=validation_rows,
+        test_rows=test_rows,
         validate_token_ids=validate_token_ids,
     )
 
@@ -978,6 +1043,7 @@ def load_parquet_text_corpus(
     parquet_backend: str,
     parquet_read_batch_size: int,
     validation_rows: int,
+    test_rows: int,
     vocab_size: int,
     eos_token_id: int,
     validate_token_ids: bool,
@@ -1000,6 +1066,7 @@ def load_parquet_text_corpus(
             tokenizer_batch_size=tokenizer_batch_size,
             parquet_read_batch_size=parquet_read_batch_size,
             validation_rows=validation_rows,
+            test_rows=test_rows,
             vocab_size=vocab_size,
             eos_token_id=eos_token_id,
             validate_token_ids=validate_token_ids,
@@ -1053,8 +1120,9 @@ def load_parquet_text_corpus(
         "hf_cache_files": cache_files,
         "dataset_fingerprint": source_fingerprint,
         "total_rows": len(dataset),
-        "train_rows": len(dataset) - validation_rows,
+        "train_rows": len(dataset) - validation_rows - test_rows,
         "validation_rows": validation_rows,
+        "test_rows": test_rows,
         "text_column": text_column,
         "tokenizer": {
             "source": tokenizer_path,
@@ -1078,6 +1146,7 @@ def load_parquet_text_corpus(
         vocab_size=vocab_size,
         tokenizer_batch_size=tokenizer_batch_size,
         validation_rows=validation_rows,
+        test_rows=test_rows,
         validate_token_ids=validate_token_ids,
     )
 

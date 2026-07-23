@@ -382,10 +382,11 @@ and continuously packs the resulting stream into 2,048-token examples.
 
 Rows are consumed in deterministic dataset order. Distributed ranks take
 disjoint contiguous row ranges, and all compared model variants receive the
-same rank-local stream. The final 10,000 rows are excluded from training and
-reserved for validation. Checkpoints store the next global row, epoch, and
-unconsumed packed-token buffer, so resume reproduces the exact subsequent token
-batch.
+same rank-local stream. The final 20,000 rows are excluded from training: the
+first 10,000 are the validation split used for screening and the final 10,000
+are an untouched test split opened only after `K`, rho, and top-k are frozen.
+Checkpoints store the next global row, epoch, and unconsumed packed-token
+buffer, so resume reproduces the exact subsequent token batch.
 
 Startup validates tokenizer vocabulary/EOS compatibility and every produced
 token id. It also detects CPU affinity, cgroup CPU quota, and cgroup memory
@@ -434,7 +435,9 @@ and all-reduce total negative log-likelihood and token count:
 It reports PPL, mean NLL, evaluated tokens, elapsed time, and sequence-block
 bootstrap intervals. Mean NLL is the primary endpoint because differences are
 additive; PPL is reported for readability. Model pairs are evaluated on exactly
-the same held-out token windows.
+the same held-out token windows. Validation selects candidates; the frozen
+5B confirmation and final seed statistics are reported on the untouched test
+split.
 
 ### 8.2 Standard benchmarks
 
@@ -451,20 +454,23 @@ exact harness version and task names will be recorded with every result.
 
 ### 8.3 Pre-registered success criteria
 
-The 500M, top-k=2, Hellinger-versus-vanilla held-out NLL comparison is primary.
-The method is considered supported only if all of the following hold:
+The primary comparison is the frozen 500M distributional configuration versus
+the top-k-matched vanilla MoE, both trained from scratch for 5B tokens. The
+500M screen may select `K`, rho, and top-k, but the choice is frozen before this
+confirmation run. The method is considered supported only if all of the
+following hold:
 
 1. Across seeds `{1337, 2027, 4099}`, mean NLL improves by at least 0.005
    nats/token (about 0.5% PPL) and the 95% confidence interval of the paired
    seed difference excludes zero.
-2. Hellinger beats both learned reducer controls by at least 0.002 nats/token,
-   or the distribution-specific claim is rejected in favor of a generic
-   nonlinear-reducer claim.
+2. The selected distributional reducer beats both learned reducer controls by
+   at least 0.002 nats/token, or the distribution-specific claim is rejected in
+   favor of a generic nonlinear-reducer claim.
 3. Disagreement/loss-gain Spearman correlation is positive with a bootstrap
    95% interval excluding zero, and the highest disagreement decile improves
    more than the lowest.
-4. The Hellinger gain does not reverse at 1.5B and retains at least half of its
-   150M relative-NLL improvement.
+4. The gain does not reverse at 1.5B and retains at least half of its 500M
+   relative-NLL improvement.
 5. Peak memory, tokens/second, and wall-clock are reported. A result with more
    than 25% throughput loss is not described as an unconditional efficiency
    improvement even if quality improves.
@@ -496,40 +502,80 @@ outcome.
 
 ## 10. Staged experiment matrix
 
-Experiments are staged so the 4xA100-80GB budget is not spent on mechanisms
-that already fail cheap controls.
+The search starts at the target 500M scale. A 150M search can rank
+hyperparameters differently from 500M and would spend compute on a scale that
+is not the primary claim. The 150M point is retained only as a late scale-trend
+measurement after a useful 500M configuration has been found.
 
-### Stage A: 150M falsification screen
+### Stage A: 500M engineering and short signal checks
 
-- top-k `{1, 2, 4}`;
-- atom count `K={5, 9, 17}`;
-- geometric, Hellinger, arithmetic, output-gated, and residual-MLP reducers;
-- fixed versus learnable rho initialized at `{0, 0.5, 1}`;
-- seed 1337, 500M-token screen after a 100M-token pipeline pilot.
+1. Profile vanilla and the default `K=9`, rho=0.5, top-k=2 distributional model
+   for 50 steps.
+2. Run the same pair for 100M tokens to verify data order, resume, validation,
+   W&B metrics, numerical stability, throughput, and correction activity.
+3. Stop if the distributional path is unstable, the correction collapses to
+   zero, or its runtime cost is unacceptable without an early NLL signal.
 
-Only variants that are numerically stable and improve held-out NLL continue.
+The pilot is an engineering gate, not evidence of model quality.
 
-### Stage B: scale trend
+### Stage B: 500M hyperparameter screen
 
-Train same-seed vanilla and the selected distributional method at:
+At seed 1337 and 500M tokens, compare a shared vanilla run with:
 
-| scale | tokens (20 tokens/parameter, rounded) |
-|---|---:|
-| 150M | 3B |
-| 500M | 10B |
-| 1.5B | 30B |
+- atom count `K={5, 9, 17}` at rho=0.5 and top-k=2;
+- rho `{0.25, 0.5, 0.75, 1}` at `K=9` and top-k=2;
+- top-k=4 at `K=9`, rho=0.5.
 
-This is the minimal three-point scale test. The existing 500M/20B configuration
-is a longer follow-up, not substituted for the matched tokens-per-parameter
-curve.
+Top-k=1 is an exact-equivalence unit/sanity test and does not consume a
+pretraining run. Generic learned reducers, learnable rho, additional seeds, and
+150M runs are intentionally excluded at this stage. Rank candidates by held-out
+NLL, stability, disagreement-conditioned gain, correction activity, and
+throughput rather than by NLL alone.
 
-### Stage C: variance and strong controls
+### Stage C: finalist refinement and frozen 500M confirmation
 
-At 500M/top-k=2, run vanilla, Hellinger, output-gated, and residual-MLP with
-seeds `{1337, 2027, 4099}`. If cost forces sequential decisions, three vanilla
-seeds first estimate the noise floor; the Hellinger and learned-control
-replicates proceed only when the pilot effect exceeds the pre-registered
-minimum detectable effect.
+Take at most two screen finalists and train each against a top-k-matched vanilla
+run from scratch for 1B tokens. Select one configuration, freeze `K`, rho, and
+top-k, then train the frozen configuration and vanilla from scratch for 5B
+tokens. The 5B pair is the seed-1337 primary comparison; it is not a continuation
+of a screen checkpoint.
+
+Proceed only if the frozen distributional model improves NLL by at least 0.005
+nats/token and the correction/disagreement analyses support the proposed
+mechanism. A weaker result is recorded as inconclusive and does not trigger the
+expensive matrix.
+
+### Stage D: strong non-distributional controls
+
+Only after the 500M/5B gate passes, train the parameter-matched dense model,
+output-gated reducer, and permutation-invariant residual-MLP reducer for the
+same 5B tokens. Train learnable rho as a diagnostic for whether the model moves
+back toward the vanilla identity at rho=0. If the generic controls match the
+selected reducer, narrow the claim to nonlinear expert aggregation.
+
+### Stage E: scale trend and seeds
+
+Use the frozen 500M winner and top-k-matched vanilla at:
+
+| scale | tokens (10 tokens/parameter, rounded) | one-GPU step cap |
+|---|---:|---:|
+| 150M | 1.5B | 15,000 |
+| 500M | 5B | 50,000 |
+| 1.5B | 15B | 150,000 |
+
+The 500M point is reused from Stage C. Run the 150M and 1.5B pairs only after
+the distribution-specific 500M claim survives Stage D. Finally, add seeds 2027
+and 4099 to the 500M vanilla/winner pair; seed 1337 is reused from Stage C.
+This ordering postpones seed cost without weakening the final three-seed test.
+
+All scale configs process 64 sequences/GPU per optimizer update:
+`32 micro-batch x 2 accumulation` at 150M/500M and
+`8 micro-batch x 8 accumulation` at 1.5B. At sequence length 2048 this is
+131,072 tokens/GPU/update. Raising accumulation by 2--4x would not reduce
+activation peak memory, would enlarge the already substantial four-GPU global
+batch, and would halve or quarter the number of optimizer updates. It is
+therefore left unchanged unless gradient variance measurements justify a
+separately retuned large-batch schedule.
 
 Every comparison records resolved config, exact parameters, data position,
 tokens, peak allocated/reserved memory, tokens/second, wall-clock, held-out NLL,

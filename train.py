@@ -265,6 +265,7 @@ def main() -> None:
                 RESOURCE_LIMITS.parquet_batch_limit,
             ),
             validation_rows=config.data.validation_rows,
+            test_rows=config.data.test_rows,
             vocab_size=config.model.vocab_size,
             eos_token_id=config.data.eos_token_id,
             validate_token_ids=config.data.validate_token_ids,

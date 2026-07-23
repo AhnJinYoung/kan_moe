@@ -41,6 +41,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bootstrap-iters", type=int, default=1_000)
     parser.add_argument("--bootstrap-seed", type=int, default=17)
     parser.add_argument("--top-k", type=int, default=None)
+    parser.add_argument(
+        "--split",
+        choices=("validation", "test"),
+        default="validation",
+        help="Use validation while selecting variants and test only after freezing them.",
+    )
     parser.add_argument("--precision", choices=["bf16", "fp16", "fp32"], default="bf16")
     parser.add_argument("--output", default="")
     return parser.parse_args()
@@ -105,11 +111,17 @@ def main() -> None:
                 RESOURCE_LIMITS.parquet_batch_limit,
             ),
             validation_rows=int(data_config.get("validation_rows", 10_000)),
+            test_rows=int(data_config.get("test_rows", 0)),
             vocab_size=model.config.vocab_size,
             eos_token_id=int(data_config["eos_token_id"]),
             validate_token_ids=bool(data_config.get("validate_token_ids", True)),
         )
-        online_batcher = corpus.validation_batcher(
+        batcher_factory = (
+            corpus.validation_batcher
+            if args.split == "validation"
+            else corpus.test_batcher
+        )
+        online_batcher = batcher_factory(
             sequence_length=sequence_length,
             batch_size=args.batch_size,
             rank=context.rank,
@@ -128,6 +140,10 @@ def main() -> None:
 
         batches = evaluation_batches()
     else:
+        if args.split == "test":
+            raise ValueError(
+                "--split test is only supported for parquet_text checkpoints"
+            )
         batches = sequential_token_batches(
             path=data_path,
             patterns=data_glob,
@@ -193,6 +209,7 @@ def main() -> None:
         "training_tokens_seen": checkpoint.get("tokens_seen"),
         "training_seed": train_config.get("seed"),
         "model_type": model.config.model_type,
+        "evaluation_split": args.split,
         "data_path": data_path,
         "data_metadata": data_metadata,
         "resource_limits": RESOURCE_LIMITS.to_dict(),
