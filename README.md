@@ -9,16 +9,17 @@ and [`RUN_MANUAL.md`](RUN_MANUAL.md) for the exact A100/FineWeb-Edu commands.
 ## Tokenizer and data
 
 The main configs use the local Llama 2 tokenizer at
-`/data/umoe_mod_share/kan_moe/llama2_tokenizer` (32,000 tokens, EOS id 2).
-`train.py` loads the local FineWeb-Edu Parquet files through Hugging Face
-Datasets, reuses the raw-text Arrow files under `HF_DATASETS_CACHE`, and
-tokenizes/continuously packs text online. It does not require a separate
-tokenized `.bin` corpus. Automatic special tokens are disabled and one EOS is
-appended per document.
+`/data/umoe_mod_share/llama2_tokenizer` (32,000 tokens, EOS id 2). The default
+backend reads FineWeb-Edu directly from Parquet row groups with PyArrow and
+tokenizes/continuously packs text online. It neither creates a full Hugging Face
+Arrow dataset nor requires a tokenized `.bin` corpus. Automatic special tokens
+are disabled and one EOS is appended per document.
 
 The final 10,000 deterministic dataset rows are excluded from training and used
-for validation. The resolved Parquet list, Dataset fingerprint, actual Arrow
-cache filenames, tokenizer contract, and packing policy are written to
+for validation. Parquet and tokenizer batches are capped at four documents,
+PyArrow multiprocessing is disabled, and startup detects cgroup CPU/memory
+limits and caps native thread pools to one or two threads. The resolved resource
+limits, Parquet layout, tokenizer contract, and packing policy are written to
 `runtime.json` and W&B.
 
 ## Installation and verification
@@ -96,7 +97,7 @@ Standard benchmarks use the pinned `lm-evaluation-harness` adapter:
 ```bash
 python3 evaluate_harness.py \
   --checkpoint /path/to/step_00009537.pt \
-  --tokenizer /data/umoe_mod_share/kan_moe/llama2_tokenizer \
+  --tokenizer /data/umoe_mod_share/llama2_tokenizer \
   --tasks mmlu,arc_easy,arc_challenge,hellaswag,piqa,winogrande,openbookqa,boolq,lambada_openai \
   --batch-size 8 \
   --output /path/to/benchmarks.json

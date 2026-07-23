@@ -262,24 +262,26 @@ chat template, BOS, padding, or tokenizer-added special tokens. One EOS token is
 added after every document.
 
 The primary input path is the local Parquet corpus at
-`/data/umoe_mod_share/fineweb_edu_100bt/sample/100BT`. The loader uses
-`load_dataset("parquet")` and the effective `HF_DATASETS_CACHE`, matching the
-previous UMoE training path. That cache contains raw-text Arrow data rather than
-tokenized training samples. A fast tokenizer therefore encodes documents online
-in batches and continuously packs the resulting stream into 2,048-token
-examples.
+`/data/umoe_mod_share/fineweb_edu_100bt/sample/100BT`. The primary loader reads
+Parquet row groups directly with PyArrow. It does not call
+`load_dataset("parquet")`, materialize the 100BT corpus as Arrow, or spawn data
+worker processes. A fast tokenizer encodes documents online in bounded batches
+and continuously packs the resulting stream into 2,048-token examples.
 
 Rows are consumed in deterministic dataset order. Distributed ranks take
-disjoint strided rows, and all three model variants receive the same rank-local
-stream. The final 10,000 rows are excluded from training and reserved for
-validation. Checkpoints store the next row, epoch, and unconsumed packed-token
-buffer, so resume reproduces the exact subsequent token batch.
+disjoint contiguous row ranges, and all three model variants receive the same
+rank-local stream. The final 10,000 rows are excluded from training and reserved
+for validation. Checkpoints store the next global row, epoch, and unconsumed
+packed-token buffer, so resume reproduces the exact subsequent token batch.
 
 Startup validates tokenizer vocabulary/EOS compatibility and every produced
-token id. `runtime.json` and W&B record the sorted Parquet sources, Dataset
-fingerprint, actual Arrow cache filenames, tokenizer contract, split boundary,
-and packing policy. The older `.bin`/`.npy` loader remains available as the
-`binary` input format.
+token id. It also detects CPU affinity, cgroup CPU quota, and cgroup memory
+limits, caps native/PyTorch thread pools to one or two threads, and limits
+Parquet/tokenizer batches to at most four documents. `runtime.json` and W&B
+record these resolved resource limits, sorted Parquet layout, tokenizer
+contract, split boundary, and packing policy. The older `.bin`/`.npy` loader
+remains available as the `binary` input format; the previous HF Arrow-cache
+backend is opt-in only.
 
 ## 7. Training implementation
 

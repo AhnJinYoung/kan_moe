@@ -12,6 +12,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 from dmoe.gpu_select import GPUSelection, configure_cuda_visibility
+from dmoe.resources import (
+    configure_conservative_cpu_runtime,
+    configure_torch_threads,
+)
 
 
 def _automatic_gpu_selection_enabled() -> bool:
@@ -22,6 +26,7 @@ def _automatic_gpu_selection_enabled() -> bool:
     return not disabled_by_cli and not disabled_by_environment
 
 
+RESOURCE_LIMITS = configure_conservative_cpu_runtime()
 GPU_SELECTION: GPUSelection = configure_cuda_visibility(
     enabled=_automatic_gpu_selection_enabled()
 )
@@ -55,6 +60,8 @@ from dmoe.distributed import (
     seed_everything,
 )
 from dmoe.model import DecoderLM
+
+configure_torch_threads(torch, RESOURCE_LIMITS)
 
 
 def parse_args() -> argparse.Namespace:
@@ -223,6 +230,7 @@ def main() -> None:
     seed_everything(config.train.seed, 0)
     runtime_info = {
         "gpu_selection": asdict(GPU_SELECTION),
+        "resource_limits": RESOURCE_LIMITS.to_dict(),
         "world_size": context.world_size,
         "cuda_device_count": torch.cuda.device_count(),
         "cuda_device_names": [
@@ -241,8 +249,18 @@ def main() -> None:
             tokenizer_revision=config.data.tokenizer_revision,
             text_column=config.data.text_column,
             cache_dir=config.data.hf_cache_dir,
-            dataset_num_proc=config.data.dataset_num_proc,
-            tokenizer_batch_size=config.data.tokenizer_batch_size,
+            dataset_num_proc=min(
+                config.data.dataset_num_proc, RESOURCE_LIMITS.data_workers
+            ),
+            tokenizer_batch_size=min(
+                config.data.tokenizer_batch_size,
+                RESOURCE_LIMITS.tokenizer_batch_limit,
+            ),
+            parquet_backend=config.data.parquet_backend,
+            parquet_read_batch_size=min(
+                config.data.parquet_read_batch_size,
+                RESOURCE_LIMITS.parquet_batch_limit,
+            ),
             validation_rows=config.data.validation_rows,
             vocab_size=config.model.vocab_size,
             eos_token_id=config.data.eos_token_id,
@@ -267,10 +285,23 @@ def main() -> None:
 
         validation_batcher_factory = make_validation_batcher
         if context.is_main:
-            cache_files = online_corpus.metadata["hf_cache_files"]
             print(
-                "loaded raw Parquet text through Hugging Face cache: "
-                f"{online_corpus.metadata['total_rows']} rows"
+                "resource limits: "
+                f"effective_cpus={RESOURCE_LIMITS.effective_cpus}, "
+                f"cpu_threads={RESOURCE_LIMITS.cpu_threads}, "
+                f"memory_limit_gib="
+                f"{RESOURCE_LIMITS.to_dict()['cgroup_memory_limit_gib']}"
+            )
+            cache_files = online_corpus.metadata.get("hf_cache_files", [])
+            print(
+                "loaded raw Parquet text source: "
+                f"{online_corpus.metadata['total_rows']} rows; "
+                f"backend={online_corpus.metadata['parquet_backend']}; "
+                f"materializes_arrow_cache="
+                f"{online_corpus.metadata['materializes_arrow_cache']}; "
+                f"read_batch={online_corpus.metadata.get('parquet_read_batch_size')}; "
+                f"tokenizer_batch="
+                f"{online_corpus.metadata.get('tokenizer_batch_size')}"
             )
             if cache_files:
                 print("HF cache files:")

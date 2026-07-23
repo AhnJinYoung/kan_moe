@@ -7,6 +7,13 @@ import time
 from pathlib import Path
 from typing import Iterator
 
+from dmoe.resources import (
+    configure_conservative_cpu_runtime,
+    configure_torch_threads,
+)
+
+RESOURCE_LIMITS = configure_conservative_cpu_runtime()
+
 import torch
 
 from dmoe.checkpoint import load_model_from_checkpoint
@@ -16,6 +23,8 @@ from dmoe.distributed import (
     cleanup_distributed,
     initialize_distributed,
 )
+
+configure_torch_threads(torch, RESOURCE_LIMITS)
 
 
 def parse_args() -> argparse.Namespace:
@@ -77,8 +86,19 @@ def main() -> None:
             tokenizer_revision=data_config.get("tokenizer_revision", ""),
             text_column=data_config.get("text_column", "text"),
             cache_dir=data_config.get("hf_cache_dir", ""),
-            dataset_num_proc=int(data_config.get("dataset_num_proc", 16)),
-            tokenizer_batch_size=int(data_config.get("tokenizer_batch_size", 64)),
+            dataset_num_proc=min(
+                int(data_config.get("dataset_num_proc", 1)),
+                RESOURCE_LIMITS.data_workers,
+            ),
+            tokenizer_batch_size=min(
+                int(data_config.get("tokenizer_batch_size", 4)),
+                RESOURCE_LIMITS.tokenizer_batch_limit,
+            ),
+            parquet_backend=data_config.get("parquet_backend", "direct"),
+            parquet_read_batch_size=min(
+                int(data_config.get("parquet_read_batch_size", 4)),
+                RESOURCE_LIMITS.parquet_batch_limit,
+            ),
             validation_rows=int(data_config.get("validation_rows", 10_000)),
             vocab_size=model.config.vocab_size,
             eos_token_id=int(data_config["eos_token_id"]),
@@ -137,6 +157,7 @@ def main() -> None:
         "model_type": model.config.model_type,
         "data_path": data_path,
         "data_metadata": data_metadata,
+        "resource_limits": RESOURCE_LIMITS.to_dict(),
         "top_k": model.config.top_k,
         "aggregation": model.config.aggregation,
         **model.parameter_report(),

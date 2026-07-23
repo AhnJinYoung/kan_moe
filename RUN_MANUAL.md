@@ -5,8 +5,7 @@
 ```text
 code:        /data/umoe_mod_share/kan_moe
 raw parquet: /data/umoe_mod_share/fineweb_edu_100bt/sample/100BT
-HF cache:    $HF_DATASETS_CACHE
-tokenizer:   /data/umoe_mod_share/kan_moe/llama2_tokenizer
+tokenizer:   /data/umoe_mod_share/llama2_tokenizer
 outputs:     /data/umoe_mod_share/kan_moe/outputs
 ```
 
@@ -27,11 +26,6 @@ python3 -m pip install -e '.[data,eval,logging,dev]'
 
 export HF_HOME=/data/umoe_mod_share/hf_cache
 export TOKENIZERS_PARALLELISM=false
-export OMP_NUM_THREADS=8
-
-# 예전 학습에 사용한 값이 이미 설정되어 있다면 바꾸지 않는다.
-echo "HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-<datasets default>}"
-python3 -c 'from datasets.config import HF_DATASETS_CACHE; print("effective cache:", HF_DATASETS_CACHE)'
 ```
 
 CUDA용 PyTorch가 이미 설치된 서버 환경을 전제로 한다. 다음 결과에서
@@ -78,22 +72,34 @@ unset CUDA_VISIBLE_DEVICES
 `DMOE_AUTO_SELECT_GPU=0`을 설정한다. idle 판정의 허용 memory는 기본
 1,024MiB이며 필요하면 `DMOE_GPU_MAX_USED_MEMORY_MIB`로 조정할 수 있다.
 
-## 2. FineWeb-Edu raw cache와 Llama 2 tokenizer 확인
+## 2. Pod 제한, FineWeb-Edu와 Llama 2 tokenizer 확인
 
-별도의 token `.bin` 전처리는 하지 않는다. 과거 코드와 동일하게
-`load_dataset("parquet", cache_dir=HF_DATASETS_CACHE)`가 만든 raw-text Arrow
-cache를 재사용하고, 학습 중 fast Llama 2 tokenizer로 online tokenization과
-continuous packing을 수행한다.
+별도의 token `.bin`이나 Hugging Face Arrow dataset을 만들지 않는다.
+PyArrow가 Parquet row group을 직접 순차적으로 읽고, 학습 중 fast Llama 2
+tokenizer로 online tokenization과 continuous packing을 수행한다. 기본값은
+reader/tokenizer batch 각각 4, dataset process 1, PyArrow `use_threads=False`다.
+
+`train.py`는 PyTorch import 전에 CPU affinity, cgroup CPU quota, cgroup memory
+limit/current usage를 읽는다. 결과에 따라 OpenMP, MKL, OpenBLAS, Rayon과
+PyTorch thread 수를 최대 1–2개로 제한하고 실제 값을 `runtime.json`과 W&B에
+기록한다. 서버에서 원시 제한을 확인하려면:
+
+```bash
+cat /sys/fs/cgroup/cpu.max 2>/dev/null || true
+cat /sys/fs/cgroup/memory.max 2>/dev/null || true
+cat /sys/fs/cgroup/memory.current 2>/dev/null || true
+python3 -c 'from dmoe.resources import detect_resource_limits; import json; print(json.dumps(detect_resource_limits().to_dict(), indent=2))'
+```
 
 ```bash
 find /data/umoe_mod_share/fineweb_edu_100bt/sample/100BT \
   -maxdepth 1 -name '*.parquet' -type f | sort | wc -l
-find /data/umoe_mod_share/kan_moe/llama2_tokenizer \
+find /data/umoe_mod_share/llama2_tokenizer \
   -maxdepth 1 -type f | sort
 
 python3 - <<'PY'
 from transformers import AutoTokenizer
-p = "/data/umoe_mod_share/kan_moe/llama2_tokenizer"
+p = "/data/umoe_mod_share/llama2_tokenizer"
 t = AutoTokenizer.from_pretrained(p, use_fast=True, trust_remote_code=False)
 print({"path": p, "vocab_size": len(t), "eos": t.eos_token_id,
        "bos": t.bos_token_id, "is_fast": t.is_fast})
@@ -101,29 +107,11 @@ assert len(t) == 32000 and t.eos_token_id == 2 and t.is_fast
 PY
 ```
 
-tokenizer 디렉터리가 다른 곳에 있다면 먼저 찾고 YAML 또는 override를
-수정한다.
-
-```bash
-find /data/umoe_mod_share -type f \
-  \( -name tokenizer.json -o -name tokenizer.model \) \
-  -path '*llama*tokenizer*' -printf '%h\n' 2>/dev/null | sort -u
-```
-
-`HF_DATASETS_CACHE`의 정확한 내부 Arrow 경로는 hash 기반이므로 추측하지
-않는다. `train.py`가 `Dataset.cache_files`를 출력하며 같은 값을
-`runtime.json`에 저장한다. 사전 확인은 다음처럼 할 수 있다.
-
-```bash
-CACHE=$(python3 -c 'from datasets.config import HF_DATASETS_CACHE; print(HF_DATASETS_CACHE)')
-find "$CACHE" -type f -name '*.arrow' -ipath '*parquet*' \
-  -printf '%s %p\n' 2>/dev/null | sort -nr | head -30
-```
-
-cache hit가 나더라도 이것은 tokenized cache가 아니라 raw-text Arrow
-cache다. tokenization은 학습 중 수행된다. 모든 비교군은 동일하게 special
-token을 자동 추가하지 않고 문서마다 EOS(id 2)를 하나 붙인다. 전체 Dataset의
-마지막 10,000 rows는 training에서 제외하고 validation에만 사용한다.
+모든 비교군은 동일하게 special token을 자동 추가하지 않고 문서마다 EOS(id
+2)를 하나 붙인다. 전체 Parquet sequence의 마지막 10,000 rows는 training에서
+제외하고 validation에만 사용한다. 정상적인 시작 로그에는 `parquet_backend:
+direct`가 기록되며 `Generating train split`이 나타나지 않는다. 그 문구가
+보이면 최신 코드/config가 아니다.
 
 ## 3. 코드와 파라미터 검증
 
@@ -266,7 +254,7 @@ CKPT=$(ls -1 "${RUN}"/step_*.pt | sort | tail -n 1)
 
 python3 evaluate_harness.py \
   --checkpoint "${CKPT}" \
-  --tokenizer /data/umoe_mod_share/kan_moe/llama2_tokenizer \
+  --tokenizer /data/umoe_mod_share/llama2_tokenizer \
   --tasks mmlu,arc_easy,arc_challenge,hellaswag,piqa,winogrande,openbookqa,boolq,lambada_openai \
   --device cuda:0 \
   --batch-size 8 \
@@ -282,7 +270,8 @@ python3 evaluate_harness.py \
 ## 9. 비교 시 반드시 고정·기록할 항목
 
 - local Llama 2 tokenizer 파일과 vocab/EOS 계약
-- raw Parquet 목록, Dataset fingerprint, 실제 `HF_DATASETS_CACHE` Arrow 파일
+- raw Parquet 목록, row/row-group layout, direct-streaming batch 제한
+- cgroup CPU/memory limit과 실제 native/PyTorch thread 수
 - train/validation row 경계와 online packing 정책
 - tokens seen, seed, sequence length, global batch, optimizer schedule
 - total parameters와 top-k별 active parameters

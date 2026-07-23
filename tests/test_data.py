@@ -7,7 +7,10 @@ import numpy as np
 
 from dmoe.data import (
     PackedTextBatcher,
+    ParquetFileLayout,
+    ParquetRowStream,
     RandomTokenBatcher,
+    StreamingPackedTextBatcher,
     sequential_token_batches,
     validate_data_manifest,
 )
@@ -125,6 +128,103 @@ class DataTest(unittest.TestCase):
         actual_inputs, actual_labels = resumed.next_batch()
         self.assertTrue((expected_inputs == actual_inputs).all())
         self.assertTrue((expected_labels == actual_labels).all())
+
+    def test_direct_parquet_stream_is_bounded_and_resumable(self) -> None:
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ImportError:
+            self.skipTest("pyarrow is an optional data dependency")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            documents = [
+                ["a", "bb", "ccc", "dddd", "eeeee"],
+                ["f", "gg", "hhh", "iiii", "jjjjj", "kkkkkk"],
+            ]
+            layouts = []
+            for index, texts in enumerate(documents):
+                path = root / f"{index}.parquet"
+                pq.write_table(
+                    pa.table({"text": texts}),
+                    path,
+                    row_group_size=2,
+                )
+                parquet = pq.ParquetFile(path)
+                layouts.append(
+                    ParquetFileLayout(
+                        path=str(path),
+                        row_count=parquet.metadata.num_rows,
+                        row_group_rows=tuple(
+                            parquet.metadata.row_group(group).num_rows
+                            for group in range(parquet.metadata.num_row_groups)
+                        ),
+                    )
+                )
+
+            stream = ParquetRowStream(
+                layouts=layouts,
+                text_column="text",
+                row_start=2,
+                row_stop=10,
+                read_batch_size=2,
+                repeat=False,
+            )
+            self.assertEqual(stream.next_texts(4), ["ccc", "dddd", "eeeee", "f"])
+            state = stream.state_dict()
+            expected = stream.next_texts(3)
+
+            resumed = ParquetRowStream(
+                layouts=layouts,
+                text_column="text",
+                row_start=2,
+                row_stop=10,
+                read_batch_size=2,
+                repeat=False,
+            )
+            resumed.load_state_dict(state)
+            self.assertEqual(resumed.next_texts(3), expected)
+            self.assertEqual(expected, ["gg", "hhh", "iiii"])
+
+            batcher = StreamingPackedTextBatcher(
+                source=ParquetRowStream(
+                    layouts=layouts,
+                    text_column="text",
+                    row_start=0,
+                    row_stop=11,
+                    read_batch_size=2,
+                    repeat=True,
+                ),
+                tokenizer=_FakeTokenizer(),
+                eos_token_id=2,
+                vocab_size=32,
+                sequence_length=3,
+                batch_size=2,
+                tokenizer_batch_size=2,
+            )
+            batcher.next_batch()
+            batcher_state = batcher.state_dict()
+            expected_batch = batcher.next_batch()
+            resumed_batcher = StreamingPackedTextBatcher(
+                source=ParquetRowStream(
+                    layouts=layouts,
+                    text_column="text",
+                    row_start=0,
+                    row_stop=11,
+                    read_batch_size=2,
+                    repeat=True,
+                ),
+                tokenizer=_FakeTokenizer(),
+                eos_token_id=2,
+                vocab_size=32,
+                sequence_length=3,
+                batch_size=2,
+                tokenizer_batch_size=2,
+            )
+            resumed_batcher.load_state_dict(batcher_state)
+            actual_batch = resumed_batcher.next_batch()
+            self.assertTrue((expected_batch[0] == actual_batch[0]).all())
+            self.assertTrue((expected_batch[1] == actual_batch[1]).all())
 
 
 if __name__ == "__main__":

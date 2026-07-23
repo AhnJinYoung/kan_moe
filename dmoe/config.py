@@ -95,8 +95,10 @@ class DataConfig:
     validate_token_ids: bool = True
     text_column: str = "text"
     hf_cache_dir: str = ""
-    dataset_num_proc: int = 16
-    tokenizer_batch_size: int = 64
+    parquet_backend: str = "direct"
+    parquet_read_batch_size: int = 4
+    dataset_num_proc: int = 1
+    tokenizer_batch_size: int = 4
     validation_rows: int = 10_000
 
     def validate(self) -> None:
@@ -111,9 +113,15 @@ class DataConfig:
                 raise ValueError("tokenizer_path is required for parquet_text input")
             if not self.text_column:
                 raise ValueError("text_column must be non-empty")
-            if self.dataset_num_proc <= 0 or self.tokenizer_batch_size <= 0:
+            if self.parquet_backend not in {"direct", "hf_cache"}:
+                raise ValueError("parquet_backend must be direct or hf_cache")
+            if (
+                self.parquet_read_batch_size <= 0
+                or self.dataset_num_proc <= 0
+                or self.tokenizer_batch_size <= 0
+            ):
                 raise ValueError(
-                    "dataset_num_proc and tokenizer_batch_size must be positive"
+                    "Parquet, dataset worker, and tokenizer batch sizes must be positive"
                 )
             if self.validation_rows <= 0:
                 raise ValueError("validation_rows must be positive")

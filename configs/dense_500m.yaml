@@ -20,14 +20,16 @@ data:
   validation_glob: "*.parquet"
   binary_dtype: uint16
   eos_token_id: 2
-  tokenizer_path: /data/umoe_mod_share/kan_moe/llama2_tokenizer
+  tokenizer_path: /data/umoe_mod_share/llama2_tokenizer
   tokenizer_revision: ""
   manifest_path: ""
   validate_token_ids: true
   text_column: text
   hf_cache_dir: ""
-  dataset_num_proc: 16
-  tokenizer_batch_size: 64
+  parquet_backend: direct
+  parquet_read_batch_size: 4
+  dataset_num_proc: 1
+  tokenizer_batch_size: 4
   validation_rows: 10000
 
 train:

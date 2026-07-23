@@ -3,6 +3,8 @@ from __future__ import annotations
 import glob
 import json
 import os
+from bisect import bisect_right
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -171,6 +173,80 @@ def resolve_parquet_files(path: str, patterns: str = "*.parquet") -> list[Path]:
     return unique
 
 
+def _load_validated_tokenizer(
+    tokenizer_path: str,
+    tokenizer_revision: str,
+    vocab_size: int,
+    eos_token_id: int,
+) -> Any:
+    try:
+        from transformers import AutoTokenizer
+    except ImportError as error:
+        raise RuntimeError(
+            "online tokenization requires `pip install -e '.[data]'`"
+        ) from error
+    local_candidate = Path(tokenizer_path).expanduser()
+    if local_candidate.is_absolute() and not local_candidate.exists():
+        raise FileNotFoundError(f"local tokenizer directory not found: {local_candidate}")
+    tokenizer_kwargs: dict[str, object] = {
+        "use_fast": True,
+        "trust_remote_code": False,
+    }
+    if tokenizer_revision:
+        tokenizer_kwargs["revision"] = tokenizer_revision
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, **tokenizer_kwargs)
+    if not tokenizer.is_fast:
+        raise ValueError("online pretraining requires a fast tokenizer")
+    if len(tokenizer) != vocab_size:
+        raise ValueError(
+            f"tokenizer has {len(tokenizer)} tokens but model vocab_size={vocab_size}"
+        )
+    if tokenizer.eos_token_id is None or int(tokenizer.eos_token_id) != eos_token_id:
+        raise ValueError(
+            f"tokenizer EOS id is {tokenizer.eos_token_id}, "
+            f"but data.eos_token_id={eos_token_id}"
+        )
+    return tokenizer
+
+
+def _encode_documents(
+    *,
+    tokenizer: Any,
+    texts: list[Any],
+    eos_token_id: int,
+    vocab_size: int,
+    validate_token_ids: bool,
+) -> list[int]:
+    normalized = [text if isinstance(text, str) else str(text or "") for text in texts]
+    encoded = tokenizer(
+        normalized,
+        add_special_tokens=False,
+        padding=False,
+        truncation=False,
+        return_attention_mask=False,
+        return_token_type_ids=False,
+    )
+    input_ids = encoded["input_ids"]
+    if len(input_ids) != len(texts):
+        raise RuntimeError(
+            f"tokenizer returned {len(input_ids)} rows for {len(texts)} documents"
+        )
+    packed: list[int] = []
+    for document_tokens in input_ids:
+        tokens = [int(token) for token in document_tokens]
+        tokens.append(eos_token_id)
+        if validate_token_ids and tokens:
+            minimum = min(tokens)
+            maximum = max(tokens)
+            if minimum < 0 or maximum >= vocab_size:
+                raise ValueError(
+                    f"online tokenizer produced ids outside [0, {vocab_size}): "
+                    f"min={minimum}, max={maximum}"
+                )
+        packed.extend(tokens)
+    return packed
+
+
 class PackedTextBatcher:
     """Deterministically tokenize and pack rows from a map-style text dataset."""
 
@@ -247,32 +323,15 @@ class PackedTextBatcher:
         texts = rows[self.text_column]
         if isinstance(texts, str):
             texts = [texts]
-        normalized = [text if isinstance(text, str) else str(text or "") for text in texts]
-        encoded = self.tokenizer(
-            normalized,
-            add_special_tokens=False,
-            padding=False,
-            truncation=False,
-            return_attention_mask=False,
-            return_token_type_ids=False,
-        )
-        input_ids = encoded["input_ids"]
-        if len(input_ids) != len(indices):
-            raise RuntimeError(
-                f"tokenizer returned {len(input_ids)} rows for {len(indices)} documents"
+        self.token_buffer.extend(
+            _encode_documents(
+                tokenizer=self.tokenizer,
+                texts=list(texts),
+                eos_token_id=self.eos_token_id,
+                vocab_size=self.vocab_size,
+                validate_token_ids=self.validate_token_ids,
             )
-        for document_tokens in input_ids:
-            tokens = [int(token) for token in document_tokens]
-            tokens.append(self.eos_token_id)
-            if self.validate_token_ids and tokens:
-                minimum = min(tokens)
-                maximum = max(tokens)
-                if minimum < 0 or maximum >= self.vocab_size:
-                    raise ValueError(
-                        f"online tokenizer produced ids outside [0, {self.vocab_size}): "
-                        f"min={minimum}, max={maximum}"
-                    )
-            self.token_buffer.extend(tokens)
+        )
         self.documents_consumed += len(indices)
         return True
 
@@ -357,6 +416,374 @@ class PackedTextBatcher:
         self.buffer_offset = 0
         self.samples_drawn = int(state.get("samples_drawn", 0))
         self.documents_consumed = int(state.get("documents_consumed", 0))
+
+
+@dataclass(frozen=True)
+class ParquetFileLayout:
+    path: str
+    row_count: int
+    row_group_rows: tuple[int, ...]
+
+
+class ParquetRowStream:
+    """Bounded-memory sequential text reader over Parquet row groups."""
+
+    def __init__(
+        self,
+        *,
+        layouts: list[ParquetFileLayout],
+        text_column: str,
+        row_start: int,
+        row_stop: int,
+        read_batch_size: int,
+        repeat: bool,
+    ) -> None:
+        total_rows = sum(layout.row_count for layout in layouts)
+        if not 0 <= row_start < row_stop <= total_rows:
+            raise ValueError(
+                f"invalid Parquet row range [{row_start}, {row_stop}) "
+                f"for {total_rows} rows"
+            )
+        self.layouts = layouts
+        self.text_column = text_column
+        self.row_start = int(row_start)
+        self.row_stop = int(row_stop)
+        self.read_batch_size = int(read_batch_size)
+        self.repeat = bool(repeat)
+        self.cursor = self.row_start
+        self.epoch = 0
+        self.file_starts = [0]
+        for layout in layouts:
+            self.file_starts.append(self.file_starts[-1] + layout.row_count)
+        self._parquet_file: Any | None = None
+        self._batch_iterator: Any | None = None
+        self._pending: list[Any] = []
+        self._pending_offset = 0
+
+    def _clear_reader(self) -> None:
+        self._batch_iterator = None
+        self._parquet_file = None
+        self._pending = []
+        self._pending_offset = 0
+
+    def _open_at_cursor(self) -> None:
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ImportError as error:
+            raise RuntimeError(
+                "direct Parquet streaming requires `pip install -e '.[data]'`"
+            ) from error
+        pa.set_cpu_count(1)
+        pa.set_io_thread_count(1)
+        file_index = bisect_right(self.file_starts, self.cursor) - 1
+        layout = self.layouts[file_index]
+        row_in_file = self.cursor - self.file_starts[file_index]
+        row_group_starts = [0]
+        for count in layout.row_group_rows:
+            row_group_starts.append(row_group_starts[-1] + count)
+        row_group_index = bisect_right(row_group_starts, row_in_file) - 1
+        offset_in_group = row_in_file - row_group_starts[row_group_index]
+
+        self._parquet_file = pq.ParquetFile(layout.path, memory_map=True)
+        self._batch_iterator = self._parquet_file.iter_batches(
+            batch_size=self.read_batch_size,
+            row_groups=[row_group_index],
+            columns=[self.text_column],
+            use_threads=False,
+        )
+        skip = offset_in_group
+        while True:
+            try:
+                batch = next(self._batch_iterator)
+            except StopIteration as error:
+                raise RuntimeError(
+                    f"could not seek to row {self.cursor} in {layout.path}"
+                ) from error
+            values = batch.column(0).to_pylist()
+            if skip >= len(values):
+                skip -= len(values)
+                continue
+            self._pending = values[skip:]
+            self._pending_offset = 0
+            return
+
+    def next_texts(self, count: int) -> list[Any]:
+        texts: list[Any] = []
+        while len(texts) < count:
+            if self.cursor >= self.row_stop:
+                if not self.repeat:
+                    break
+                self.epoch += 1
+                self.cursor = self.row_start
+                self._clear_reader()
+            if self._pending_offset < len(self._pending):
+                available = len(self._pending) - self._pending_offset
+                take = min(count - len(texts), available, self.row_stop - self.cursor)
+                end = self._pending_offset + take
+                texts.extend(self._pending[self._pending_offset : end])
+                self._pending_offset = end
+                self.cursor += take
+                continue
+            self._pending = []
+            self._pending_offset = 0
+            if self._batch_iterator is None:
+                self._open_at_cursor()
+                continue
+            try:
+                batch = next(self._batch_iterator)
+                self._pending = batch.column(0).to_pylist()
+            except StopIteration:
+                self._clear_reader()
+        return texts
+
+    def state_dict(self) -> dict[str, object]:
+        return {
+            "row_start": self.row_start,
+            "row_stop": self.row_stop,
+            "read_batch_size": self.read_batch_size,
+            "cursor": self.cursor,
+            "epoch": self.epoch,
+        }
+
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        expected = (self.row_start, self.row_stop, self.read_batch_size)
+        observed = (
+            int(state.get("row_start", -1)),
+            int(state.get("row_stop", -1)),
+            int(state.get("read_batch_size", -1)),
+        )
+        if observed != expected:
+            raise ValueError(
+                "checkpoint Parquet stream layout is incompatible: "
+                f"checkpoint={observed}, current={expected}"
+            )
+        cursor = int(state["cursor"])
+        if not self.row_start <= cursor <= self.row_stop:
+            raise ValueError("checkpoint Parquet cursor is outside this data split")
+        self.cursor = cursor
+        self.epoch = int(state.get("epoch", 0))
+        self._clear_reader()
+
+
+class StreamingPackedTextBatcher:
+    """Online tokenizer/packer backed by a bounded-memory row stream."""
+
+    def __init__(
+        self,
+        *,
+        source: ParquetRowStream,
+        tokenizer: Any,
+        eos_token_id: int,
+        vocab_size: int,
+        sequence_length: int,
+        batch_size: int,
+        tokenizer_batch_size: int,
+        validate_token_ids: bool = True,
+    ) -> None:
+        self.source = source
+        self.tokenizer = tokenizer
+        self.eos_token_id = int(eos_token_id)
+        self.vocab_size = int(vocab_size)
+        self.sequence_length = int(sequence_length)
+        self.batch_size = int(batch_size)
+        self.tokenizer_batch_size = int(tokenizer_batch_size)
+        self.validate_token_ids = bool(validate_token_ids)
+        self.token_buffer: list[int] = []
+        self.buffer_offset = 0
+        self.samples_drawn = 0
+        self.documents_consumed = 0
+
+    def _tokenize_more(self) -> bool:
+        texts = self.source.next_texts(self.tokenizer_batch_size)
+        if not texts:
+            return False
+        self.token_buffer.extend(
+            _encode_documents(
+                tokenizer=self.tokenizer,
+                texts=texts,
+                eos_token_id=self.eos_token_id,
+                vocab_size=self.vocab_size,
+                validate_token_ids=self.validate_token_ids,
+            )
+        )
+        self.documents_consumed += len(texts)
+        return True
+
+    def _ensure_tokens(self, count: int) -> bool:
+        while len(self.token_buffer) - self.buffer_offset < count:
+            if not self._tokenize_more():
+                return False
+        return True
+
+    def next_batch(
+        self, device: torch.device | str = "cpu"
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        token_count = self.batch_size * self.sequence_length
+        if not self._ensure_tokens(token_count + 1):
+            raise StopIteration
+        start = self.buffer_offset
+        packed = torch.tensor(
+            self.token_buffer[start : start + token_count + 1], dtype=torch.long
+        )
+        self.buffer_offset += token_count
+        if self.buffer_offset >= 1_000_000 or self.buffer_offset * 2 >= len(
+            self.token_buffer
+        ):
+            self.token_buffer = self.token_buffer[self.buffer_offset :]
+            self.buffer_offset = 0
+        self.samples_drawn += self.batch_size
+        return (
+            packed[:-1]
+            .view(self.batch_size, self.sequence_length)
+            .to(device=device, non_blocking=True),
+            packed[1:]
+            .view(self.batch_size, self.sequence_length)
+            .to(device=device, non_blocking=True),
+        )
+
+    def state_dict(self) -> dict[str, object]:
+        return {
+            "source": self.source.state_dict(),
+            "token_buffer": self.token_buffer[self.buffer_offset :],
+            "samples_drawn": self.samples_drawn,
+            "documents_consumed": self.documents_consumed,
+        }
+
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        source_state = state.get("source")
+        if not isinstance(source_state, dict):
+            raise ValueError("checkpoint is missing its Parquet source state")
+        self.source.load_state_dict(source_state)
+        stored_buffer = state.get("token_buffer", [])
+        if not isinstance(stored_buffer, list):
+            raise ValueError("checkpoint token buffer must be a list")
+        self.token_buffer = [int(token) for token in stored_buffer]
+        self.buffer_offset = 0
+        self.samples_drawn = int(state.get("samples_drawn", 0))
+        self.documents_consumed = int(state.get("documents_consumed", 0))
+
+
+def _partition_rows(
+    row_start: int, row_stop: int, rank: int, world_size: int
+) -> tuple[int, int]:
+    if not 0 <= rank < world_size:
+        raise ValueError("rank must fall inside world_size")
+    total = row_stop - row_start
+    quotient, remainder = divmod(total, world_size)
+    local_start = row_start + rank * quotient + min(rank, remainder)
+    local_stop = local_start + quotient + (1 if rank < remainder else 0)
+    if local_start >= local_stop:
+        raise ValueError("data split contains fewer rows than distributed ranks")
+    return local_start, local_stop
+
+
+class DirectParquetTextCorpus:
+    """Metadata-only Parquet corpus; no Arrow dataset is materialized."""
+
+    def __init__(
+        self,
+        *,
+        layouts: list[ParquetFileLayout],
+        tokenizer: Any,
+        metadata: dict[str, object],
+        text_column: str,
+        eos_token_id: int,
+        vocab_size: int,
+        tokenizer_batch_size: int,
+        parquet_read_batch_size: int,
+        validation_rows: int,
+        validate_token_ids: bool,
+    ) -> None:
+        self.layouts = layouts
+        self.tokenizer = tokenizer
+        self.metadata = metadata
+        self.text_column = text_column
+        self.eos_token_id = eos_token_id
+        self.vocab_size = vocab_size
+        self.tokenizer_batch_size = tokenizer_batch_size
+        self.parquet_read_batch_size = parquet_read_batch_size
+        self.validation_rows = validation_rows
+        self.validate_token_ids = validate_token_ids
+        self.total_rows = sum(layout.row_count for layout in layouts)
+        if validation_rows >= self.total_rows:
+            raise ValueError(
+                f"validation_rows={validation_rows} leaves no training rows "
+                f"from {self.total_rows} rows"
+            )
+
+    @property
+    def train_rows(self) -> int:
+        return self.total_rows - self.validation_rows
+
+    def _batcher(
+        self,
+        *,
+        row_start: int,
+        row_stop: int,
+        sequence_length: int,
+        batch_size: int,
+        rank: int,
+        world_size: int,
+        repeat: bool,
+    ) -> StreamingPackedTextBatcher:
+        local_start, local_stop = _partition_rows(
+            row_start, row_stop, rank, world_size
+        )
+        source = ParquetRowStream(
+            layouts=self.layouts,
+            text_column=self.text_column,
+            row_start=local_start,
+            row_stop=local_stop,
+            read_batch_size=self.parquet_read_batch_size,
+            repeat=repeat,
+        )
+        return StreamingPackedTextBatcher(
+            source=source,
+            tokenizer=self.tokenizer,
+            eos_token_id=self.eos_token_id,
+            vocab_size=self.vocab_size,
+            sequence_length=sequence_length,
+            batch_size=batch_size,
+            tokenizer_batch_size=self.tokenizer_batch_size,
+            validate_token_ids=self.validate_token_ids,
+        )
+
+    def train_batcher(
+        self,
+        *,
+        sequence_length: int,
+        batch_size: int,
+        rank: int,
+        world_size: int,
+    ) -> StreamingPackedTextBatcher:
+        return self._batcher(
+            row_start=0,
+            row_stop=self.train_rows,
+            sequence_length=sequence_length,
+            batch_size=batch_size,
+            rank=rank,
+            world_size=world_size,
+            repeat=True,
+        )
+
+    def validation_batcher(
+        self,
+        *,
+        sequence_length: int,
+        batch_size: int,
+        rank: int,
+        world_size: int,
+    ) -> StreamingPackedTextBatcher:
+        return self._batcher(
+            row_start=self.train_rows,
+            row_stop=self.total_rows,
+            sequence_length=sequence_length,
+            batch_size=batch_size,
+            rank=rank,
+            world_size=world_size,
+            repeat=False,
+        )
 
 
 class ParquetTextCorpus:
@@ -445,6 +872,99 @@ class ParquetTextCorpus:
         )
 
 
+def _load_direct_parquet_text_corpus(
+    *,
+    parquet_files: list[Path],
+    tokenizer: Any,
+    text_column: str,
+    tokenizer_path: str,
+    tokenizer_revision: str,
+    tokenizer_batch_size: int,
+    parquet_read_batch_size: int,
+    validation_rows: int,
+    vocab_size: int,
+    eos_token_id: int,
+    validate_token_ids: bool,
+) -> DirectParquetTextCorpus:
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError as error:
+        raise RuntimeError(
+            "direct Parquet streaming requires `pip install -e '.[data]'`"
+        ) from error
+    pa.set_cpu_count(1)
+    pa.set_io_thread_count(1)
+    layouts: list[ParquetFileLayout] = []
+    for path in parquet_files:
+        parquet_file = pq.ParquetFile(path, memory_map=True)
+        if text_column not in parquet_file.schema_arrow.names:
+            raise KeyError(
+                f"text column {text_column!r} is absent from {path}; "
+                f"available columns: {parquet_file.schema_arrow.names}"
+            )
+        metadata = parquet_file.metadata
+        layouts.append(
+            ParquetFileLayout(
+                path=str(path),
+                row_count=metadata.num_rows,
+                row_group_rows=tuple(
+                    metadata.row_group(index).num_rows
+                    for index in range(metadata.num_row_groups)
+                ),
+            )
+        )
+    total_rows = sum(layout.row_count for layout in layouts)
+    if validation_rows >= total_rows:
+        raise ValueError(
+            f"validation_rows={validation_rows} leaves no training rows "
+            f"from {total_rows} rows"
+        )
+    corpus_metadata: dict[str, object] = {
+        "input_format": "parquet_text",
+        "parquet_backend": "direct",
+        "materializes_arrow_cache": False,
+        "parquet_files": [
+            {
+                "path": layout.path,
+                "rows": layout.row_count,
+                "row_groups": len(layout.row_group_rows),
+            }
+            for layout in layouts
+        ],
+        "total_rows": total_rows,
+        "train_rows": total_rows - validation_rows,
+        "validation_rows": validation_rows,
+        "text_column": text_column,
+        "tokenizer_batch_size": tokenizer_batch_size,
+        "parquet_read_batch_size": parquet_read_batch_size,
+        "tokenizer": {
+            "source": tokenizer_path,
+            "revision": tokenizer_revision,
+            "vocab_size": len(tokenizer),
+            "eos_token_id": tokenizer.eos_token_id,
+            "is_fast": tokenizer.is_fast,
+        },
+        "packing": {
+            "add_special_tokens": False,
+            "append_eos_per_document": True,
+            "shuffle": False,
+        },
+    }
+    return DirectParquetTextCorpus(
+        layouts=layouts,
+        tokenizer=tokenizer,
+        metadata=corpus_metadata,
+        text_column=text_column,
+        eos_token_id=eos_token_id,
+        vocab_size=vocab_size,
+        tokenizer_batch_size=tokenizer_batch_size,
+        parquet_read_batch_size=parquet_read_batch_size,
+        validation_rows=validation_rows,
+        validate_token_ids=validate_token_ids,
+    )
+
+
 def load_parquet_text_corpus(
     *,
     path: str,
@@ -455,22 +975,44 @@ def load_parquet_text_corpus(
     cache_dir: str,
     dataset_num_proc: int,
     tokenizer_batch_size: int,
+    parquet_backend: str,
+    parquet_read_batch_size: int,
     validation_rows: int,
     vocab_size: int,
     eos_token_id: int,
     validate_token_ids: bool,
-) -> ParquetTextCorpus:
-    """Load/reuse the raw Arrow cache; tokenize and pack documents on demand."""
+) -> ParquetTextCorpus | DirectParquetTextCorpus:
+    """Open raw Parquet directly or reuse an explicitly requested HF cache."""
+    parquet_files = resolve_parquet_files(path, patterns)
+    tokenizer = _load_validated_tokenizer(
+        tokenizer_path,
+        tokenizer_revision,
+        vocab_size,
+        eos_token_id,
+    )
+    if parquet_backend == "direct":
+        return _load_direct_parquet_text_corpus(
+            parquet_files=parquet_files,
+            tokenizer=tokenizer,
+            text_column=text_column,
+            tokenizer_path=tokenizer_path,
+            tokenizer_revision=tokenizer_revision,
+            tokenizer_batch_size=tokenizer_batch_size,
+            parquet_read_batch_size=parquet_read_batch_size,
+            validation_rows=validation_rows,
+            vocab_size=vocab_size,
+            eos_token_id=eos_token_id,
+            validate_token_ids=validate_token_ids,
+        )
+    if parquet_backend != "hf_cache":
+        raise ValueError("parquet_backend must be direct or hf_cache")
     try:
         from datasets import config as datasets_config
         from datasets import load_dataset
-        from transformers import AutoTokenizer
     except ImportError as error:
         raise RuntimeError(
-            "parquet_text input requires `pip install -e '.[data]'`"
+            "hf_cache Parquet backend requires `pip install -e '.[data]'`"
         ) from error
-
-    parquet_files = resolve_parquet_files(path, patterns)
     effective_cache = (
         str(Path(cache_dir).expanduser())
         if cache_dir
@@ -478,25 +1020,6 @@ def load_parquet_text_corpus(
             "HF_DATASETS_CACHE", str(datasets_config.HF_DATASETS_CACHE)
         )
     )
-
-    tokenizer_kwargs: dict[str, object] = {
-        "use_fast": True,
-        "trust_remote_code": False,
-    }
-    if tokenizer_revision:
-        tokenizer_kwargs["revision"] = tokenizer_revision
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, **tokenizer_kwargs)
-    if not tokenizer.is_fast:
-        raise ValueError("online pretraining requires a fast tokenizer")
-    if len(tokenizer) != vocab_size:
-        raise ValueError(
-            f"tokenizer has {len(tokenizer)} tokens but model vocab_size={vocab_size}"
-        )
-    if tokenizer.eos_token_id is None or int(tokenizer.eos_token_id) != eos_token_id:
-        raise ValueError(
-            f"tokenizer EOS id is {tokenizer.eos_token_id}, "
-            f"but data.eos_token_id={eos_token_id}"
-        )
 
     dataset = load_dataset(
         "parquet",
@@ -523,6 +1046,8 @@ def load_parquet_text_corpus(
     ]
     metadata: dict[str, object] = {
         "input_format": "parquet_text",
+        "parquet_backend": "hf_cache",
+        "materializes_arrow_cache": True,
         "parquet_files": [str(item) for item in parquet_files],
         "hf_cache_dir": effective_cache,
         "hf_cache_files": cache_files,
