@@ -206,6 +206,9 @@ def maybe_initialize_wandb(
 def main() -> None:
     args = parse_args()
     config = load_experiment_config(args.config, args.override)
+    # Common parameter names receive identical initialization across reducer
+    # variants for a given training seed, independent of extra control modules.
+    config.model.initialization_seed = config.train.seed
     expects_cuda = GPU_SELECTION.auto_selected or (
         GPU_SELECTION.mode == "explicit"
         and GPU_SELECTION.visible_devices.strip() not in {"", "-1"}
@@ -425,6 +428,8 @@ def main() -> None:
     last_log_time = time.perf_counter()
     last_logged_tokens = tokens_seen
     optimizer.zero_grad(set_to_none=True)
+    if context.device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(context.device)
 
     try:
         for step_index in range(start_step, total_steps):
@@ -453,6 +458,7 @@ def main() -> None:
                         "max_load_fraction",
                         "distribution_entropy",
                         "nonlinear_correction_ratio",
+                        "aggregation_rho",
                     ],
                     start=2,
                 ):
@@ -484,9 +490,32 @@ def main() -> None:
                     "max_load_fraction": accumulated[4].item(),
                     "distribution_entropy": accumulated[5].item(),
                     "nonlinear_correction_ratio": accumulated[6].item(),
+                    "aggregation_rho": accumulated[7].item(),
                     "grad_norm": float(grad_norm),
                     "tokens_per_second": throughput,
                 }
+                if context.device.type == "cuda":
+                    gib = float(1024**3)
+                    record.update(
+                        {
+                            "cuda_memory_allocated_gib": (
+                                torch.cuda.memory_allocated(context.device) / gib
+                            ),
+                            "cuda_memory_reserved_gib": (
+                                torch.cuda.memory_reserved(context.device) / gib
+                            ),
+                            "cuda_peak_memory_allocated_gib": (
+                                torch.cuda.max_memory_allocated(context.device) / gib
+                            ),
+                            "cuda_peak_memory_reserved_gib": (
+                                torch.cuda.max_memory_reserved(context.device) / gib
+                            ),
+                        }
+                    )
+                for layer_index, rho in enumerate(
+                    raw_model.aggregation_rho_values()
+                ):
+                    record[f"aggregation_rho_layer_{layer_index}"] = rho
                 if context.is_main:
                     print(json.dumps(record, sort_keys=True))
                     with metrics_path.open("a", encoding="utf-8") as handle:

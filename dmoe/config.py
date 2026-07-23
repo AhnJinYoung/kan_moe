@@ -25,6 +25,9 @@ class ModelConfig:
     distribution_k: int = 9
     aggregation: str = "hellinger"
     power_rho: float = 0.5
+    learnable_rho: bool = False
+    rho_limit: float = 2.0
+    reducer_hidden_dim: int = 64
     sinkhorn_epsilon: float = 0.1
     sinkhorn_iterations: int = 8
     rope_theta: float = 10_000.0
@@ -35,9 +38,16 @@ class ModelConfig:
     router_jitter: float = 0.0
     tie_embeddings: bool = True
     gradient_checkpointing: bool = True
+    initialization_seed: int = 0
 
     def validate(self) -> None:
-        valid_types = {"dense", "vanilla_moe", "distributional_moe"}
+        valid_types = {
+            "dense",
+            "vanilla_moe",
+            "distributional_moe",
+            "output_gated_moe",
+            "residual_mlp_moe",
+        }
         if self.model_type not in valid_types:
             raise ValueError(
                 f"model_type must be one of {sorted(valid_types)}, got {self.model_type}"
@@ -74,6 +84,17 @@ class ModelConfig:
                 raise ValueError(
                     f"aggregation must be one of {sorted(valid_aggregations)}"
                 )
+            if self.learnable_rho and self.aggregation != "power":
+                raise ValueError(
+                    "learnable_rho requires aggregation=power so the learned "
+                    "parameter is not shadowed by a fixed named aggregation"
+                )
+            if self.rho_limit <= 0:
+                raise ValueError("rho_limit must be positive")
+            if abs(self.power_rho) > self.rho_limit:
+                raise ValueError("power_rho must lie within [-rho_limit, rho_limit]")
+        if self.model_type == "residual_mlp_moe" and self.reducer_hidden_dim <= 0:
+            raise ValueError("reducer_hidden_dim must be positive")
         if self.vocab_size <= 0 or self.max_seq_len <= 1:
             raise ValueError("vocab_size and max_seq_len must be positive")
         if self.dropout < 0.0 or self.dropout >= 1.0:

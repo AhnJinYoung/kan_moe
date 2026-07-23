@@ -70,6 +70,8 @@ class DistributionAggregator(nn.Module):
         distribution_k: int,
         method: str,
         power_rho: float = 0.5,
+        learnable_rho: bool = False,
+        rho_limit: float = 2.0,
         sinkhorn_epsilon: float = 0.1,
         sinkhorn_iterations: int = 8,
     ) -> None:
@@ -77,20 +79,89 @@ class DistributionAggregator(nn.Module):
         self.codec = SimplexCodec(d_model, distribution_k)
         self.method = method
         self.power_rho = power_rho
+        self.learnable_rho = learnable_rho
+        self.rho_limit = rho_limit
+        if learnable_rho:
+            self.rho_parameter = nn.Parameter(
+                torch.tensor(float(power_rho), dtype=torch.float32)
+            )
+        else:
+            self.register_parameter("rho_parameter", None)
         self.sinkhorn_epsilon = sinkhorn_epsilon
         self.sinkhorn_iterations = sinkhorn_iterations
+        self.collect_token_metrics = False
+        self.last_token_metrics: dict[str, torch.Tensor] = {}
         centers = torch.linspace(-1.0, 1.0, distribution_k)
         cost = (centers[:, None] - centers[None, :]).square()
         self.register_buffer("transport_cost", cost, persistent=True)
 
-    def _rho(self) -> float:
+    def set_collect_token_metrics(self, enabled: bool) -> None:
+        self.collect_token_metrics = enabled
+        if not enabled:
+            self.last_token_metrics = {}
+
+    def reported_rho(self) -> float:
         if self.method == "geometric":
             return 0.0
-        if self.method == "hellinger":
-            return 0.5
-        if self.method == "arithmetic":
-            return 1.0
-        return self.power_rho
+        if self.learnable_rho:
+            if self.rho_parameter is None:
+                raise RuntimeError("learnable rho parameter is missing")
+            return float(
+                self.rho_parameter.detach().clamp(
+                    -self.rho_limit, self.rho_limit
+                )
+            )
+        return float(
+            {
+                "hellinger": 0.5,
+                "arithmetic": 1.0,
+                "power": self.power_rho,
+            }.get(self.method, 0.0)
+        )
+
+    def _rho(self, reference: torch.Tensor) -> torch.Tensor:
+        if self.method == "geometric":
+            return reference.new_zeros((), dtype=torch.float32)
+        if self.learnable_rho:
+            if self.rho_parameter is None:
+                raise RuntimeError("learnable rho parameter is missing")
+            return self.rho_parameter.clamp(-self.rho_limit, self.rho_limit).to(
+                device=reference.device
+            )
+        value = {
+            "hellinger": 0.5,
+            "arithmetic": 1.0,
+            "power": self.power_rho,
+        }.get(self.method, 0.0)
+        return reference.new_tensor(value, dtype=torch.float32)
+
+    @staticmethod
+    def _power_log_pool(
+        log_probabilities: torch.Tensor,
+        normalized_weights: torch.Tensor,
+        rho: torch.Tensor,
+    ) -> torch.Tensor:
+        """Stable power pool, including a differentiable limit at rho=0."""
+        log_weight = normalized_weights.clamp_min(1e-12).log()
+        if abs(float(rho.detach())) >= 1e-3:
+            return torch.logsumexp(
+                log_weight[:, :, None, None] + rho * log_probabilities,
+                dim=1,
+            ) / rho
+
+        # log E[exp(rho X)] / rho is the cumulant-generating function
+        # divided by rho. The expansion lets a learned rho cross zero while
+        # preserving gradients with respect to rho.
+        weights = normalized_weights[:, :, None, None]
+        mean = (weights * log_probabilities).sum(dim=1)
+        centered = log_probabilities - mean[:, None, :, :]
+        variance = (weights * centered.square()).sum(dim=1)
+        third_cumulant = (weights * centered.pow(3)).sum(dim=1)
+        return (
+            mean
+            + 0.5 * rho * variance
+            + (rho.square() / 6.0) * third_cumulant
+        )
 
     def _sinkhorn_barycenter(
         self, probabilities: torch.Tensor, weights: torch.Tensor
@@ -152,16 +223,14 @@ class DistributionAggregator(nn.Module):
             pooled_log_prob = pooled_probability.float().clamp_min(1e-12).log()
             pooled_output = self.codec.ilr(pooled_log_prob).to(selected_outputs.dtype)
         else:
-            rho = self._rho()
-            if abs(rho) < 1e-7:
+            rho = self._rho(log_probabilities)
+            if not self.learnable_rho and abs(float(rho)) < 1e-7:
                 pooled_output = linear_output
                 pooled_log_prob = self.codec.inverse_ilr(pooled_output).float()
             else:
-                log_weight = normalized_weights.clamp_min(1e-12).log()
-                pooled_log_mass = torch.logsumexp(
-                    log_weight[:, :, None, None] + rho * log_probabilities,
-                    dim=1,
-                ) / rho
+                pooled_log_mass = self._power_log_pool(
+                    log_probabilities, normalized_weights, rho
+                )
                 pooled_output = self.codec.ilr(pooled_log_mass).to(
                     selected_outputs.dtype
                 )
@@ -176,9 +245,31 @@ class DistributionAggregator(nn.Module):
         entropy = -(probability * normalized_log_prob).sum(dim=-1).mean()
         correction = (pooled_output.float() - linear_output.float()).norm(dim=-1)
         baseline_norm = linear_output.float().norm(dim=-1).clamp_min(1e-6)
-        correction_ratio = (correction / baseline_norm).mean()
+        token_correction_ratio = correction / baseline_norm
+        correction_ratio = token_correction_ratio.mean()
+        effective_rho = self._rho(log_probabilities)
+        expert_js_divergence = selected_outputs.new_zeros((), dtype=torch.float32)
+        if self.collect_token_metrics:
+            log_mixture = torch.logsumexp(
+                normalized_weights.clamp_min(1e-12).log()[:, :, None, None]
+                + log_probabilities,
+                dim=1,
+            )
+            expert_kl = (
+                log_probabilities.exp()
+                * (log_probabilities - log_mixture[:, None, :, :])
+            ).sum(dim=-1).mean(dim=-1)
+            token_js = (normalized_weights * expert_kl).sum(dim=1).clamp_min(0.0)
+            expert_js_divergence = token_js.mean()
+            self.last_token_metrics = {
+                "expert_js_divergence": token_js.detach(),
+                "nonlinear_correction_ratio": token_correction_ratio.detach(),
+            }
+        else:
+            self.last_token_metrics = {}
         return pooled_output, {
             "distribution_entropy": entropy,
             "nonlinear_correction_ratio": correction_ratio,
+            "aggregation_rho": effective_rho,
+            "expert_js_divergence": expert_js_divergence,
         }
-

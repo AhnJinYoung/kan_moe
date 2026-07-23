@@ -1,0 +1,57 @@
+model:
+  model_type: dense
+  vocab_size: 32000
+  max_seq_len: 2048
+  n_layers: 16
+  d_model: 1024
+  n_heads: 16
+  ffn_dim: 28288
+  n_experts: 16
+  top_k: 2
+  moe_layers: []
+  dropout: 0.0
+  gradient_checkpointing: true
+
+data:
+  input_format: parquet_text
+  train_path: /data/umoe_mod_share/fineweb_edu_100bt/sample/100BT
+  validation_path: ""
+  train_glob: "*.parquet"
+  validation_glob: "*.parquet"
+  binary_dtype: uint16
+  eos_token_id: 2
+  tokenizer_path: /data/umoe_mod_share/llama2_tokenizer
+  tokenizer_revision: ""
+  manifest_path: ""
+  validate_token_ids: true
+  text_column: text
+  hf_cache_dir: ""
+  parquet_backend: direct
+  parquet_read_batch_size: 4
+  dataset_num_proc: 1
+  tokenizer_batch_size: 4
+  validation_rows: 10000
+
+train:
+  output_dir: /data/umoe_mod_share/kan_moe/outputs/dense_1_5b
+  seed: 1337
+  sequence_length: 2048
+  micro_batch_size: 8
+  gradient_accumulation_steps: 8
+  max_steps: 250000
+  max_tokens: 30000000000
+  learning_rate: 0.0002
+  min_learning_rate: 0.00002
+  warmup_steps: 1000
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+  precision: bf16
+  use_tf32: true
+  compile_model: false
+  log_interval: 10
+  eval_interval: 500
+  eval_batches: 50
+  save_interval: 500
+  keep_last_checkpoints: 3

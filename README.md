@@ -1,8 +1,10 @@
 # Distributional MoE
 
-This repository compares parameter-matched ~505M dense, vanilla sparse-MoE,
-and distribution-valued sparse-MoE decoder language models. Both MoE variants
-have 16 experts and configurable top-k routing. See
+This repository tests disagreement-dependent MoE aggregation at approximately
+150M, 500M, and 1.5B total parameters. It compares parameter-matched dense,
+vanilla sparse-MoE, and distributional sparse-MoE models against learned
+output-gating and permutation-invariant residual-MLP reducers. All MoEs have
+16 experts and configurable top-k routing. See
 [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) for the mathematical design
 and [`RUN_MANUAL.md`](RUN_MANUAL.md) for the exact A100/FineWeb-Edu commands.
 
@@ -33,9 +35,15 @@ python3 -m pip install torch==2.11.0 \
 python3 -m pip install -e '.[data,eval,logging,dev]'
 python3 -m unittest discover -s tests -v
 python3 scripts/count_parameters.py \
+  configs/dense_150m.yaml \
+  configs/vanilla_moe_150m.yaml \
+  configs/distributional_moe_150m.yaml \
   configs/dense_500m.yaml \
   configs/vanilla_moe_500m.yaml \
-  configs/distributional_moe_500m.yaml
+  configs/distributional_moe_500m.yaml \
+  configs/dense_1_5b.yaml \
+  configs/vanilla_moe_1_5b.yaml \
+  configs/distributional_moe_1_5b.yaml
 ```
 
 Expected totals are 504,122,112 parameters for dense and 504,195,840 for each
@@ -79,7 +87,19 @@ torchrun --standalone --nproc_per_node=4 train.py \
 Available distributional aggregators are `geometric` (exact vanilla-equivalent
 control), `hellinger` (primary), `arithmetic`, general `power`, and optional
 `wasserstein`. Set them with `--override model.aggregation=...`; general power
-pooling also accepts `--override model.power_rho=0.75`.
+pooling also accepts `--override model.power_rho=0.75`. Layerwise learned rho
+uses `model.aggregation=power` and `model.learnable_rho=true`.
+
+The pre-registered pilot, 150M falsification screen, three-scale curve, and
+three-seed matrix can be inspected without launching jobs:
+
+```bash
+python3 scripts/experiment_matrix.py --stage screening --nproc-per-node 4
+python3 scripts/experiment_matrix.py --stage scaling --nproc-per-node 4
+python3 scripts/experiment_matrix.py --stage seeds --nproc-per-node 4
+```
+
+Add `--execute` only after reviewing the emitted commands.
 
 ## Evaluation
 
@@ -98,7 +118,18 @@ Standard benchmarks use the pinned `lm-evaluation-harness` adapter:
 python3 evaluate_harness.py \
   --checkpoint /path/to/step_00009537.pt \
   --tokenizer /data/umoe_mod_share/llama2_tokenizer \
-  --tasks mmlu,arc_easy,arc_challenge,hellaswag,piqa,winogrande,openbookqa,boolq,lambada_openai \
+  --suite primary \
   --batch-size 8 \
   --output /path/to/benchmarks.json
+```
+
+The primary suite is LAMBADA, PIQA, and HellaSwag; near-chance tasks at small
+scale are isolated under `--suite secondary`. Paired mechanism analysis uses:
+
+```bash
+python3 analyze_mechanism.py \
+  --checkpoint /path/to/distributional.pt \
+  --baseline-checkpoint /path/to/same_seed_vanilla.pt \
+  --max-tokens 1000000 \
+  --output /path/to/mechanism.json
 ```

@@ -1,47 +1,68 @@
 # Distributional MoE: implementation and experiment plan
 
-## 1. Goal and comparison contract
+## 1. Goal, falsifiable claim, and comparison contract
 
-We will implement three decoder-only language models around 500M **total**
-parameters:
+The primary claim is deliberately narrower than “expert outputs are calibrated
+probability distributions”:
 
-1. `dense`: every transformer block contains a dense SwiGLU FFN.
-2. `vanilla_moe`: six of twelve FFNs are replaced by a 16-expert, dropless,
-   token-routed MoE and selected expert vectors are combined linearly.
-3. `distributional_moe`: it has exactly the same expert and router parameters as
-   `vanilla_moe`, but interprets each expert vector as coordinates of a product
-   distribution and combines those distributions before mapping back to the
-   transformer residual stream.
+> A fixed product-simplex geometry supplies a useful inductive bias for
+> disagreement-dependent aggregation of selected MoE experts, beyond what is
+> explained by parameter count, an arbitrary nonlinearity, or an extra learned
+> gate.
 
-The three models use the same tokenizer, attention design, embedding design,
-normalization, micro/global batch, training data order, optimizer, and token budget. Their total parameter counts
-must differ by less than 5%; the selected dimensions below make the difference
-less than 0.02%. `top_k` is a runtime/configuration choice in `[1, 16]` and does
-not change the number of model parameters.
+This claim is falsified if the gain is matched by a small generic learned
+reducer, does not concentrate on high-disagreement tokens, disappears as scale
+increases, or vanishes across seeds.
 
-“Distribution” in this project means a structured latent representation. It is
-not calibrated epistemic uncertainty unless a future probabilistic training
-objective supplies that semantics.
+We compare the following decoder-only models at approximately 150M, 500M, and
+1.5B **total** parameters:
 
-## 2. Common architecture and parameter count
+1. `dense`: dense SwiGLU FFNs in every block.
+2. `vanilla_moe`: 16-expert dropless MoE with a linear router-weighted sum.
+3. `distributional_moe`: the same experts/router with product-simplex pooling.
+4. `output_gated_moe`: a non-distributional control that learns a second
+   content-dependent scalar gate over selected expert outputs.
+5. `residual_mlp_moe`: a non-distributional, permutation-invariant low-rank MLP
+   over the selected-output mean and variance.
+
+All variants use the same tokenizer, attention, normalization, routed expert
+dimensions, data order, optimizer, global batch, and token budget within each
+comparison. Vanilla and fixed distributional MoE have exactly the same
+trainable parameter count. Learned controls add less than 1%, and all reported
+comparisons include exact total and active parameter counts. `top_k` remains a
+configuration choice in `[1, 16]`. Parameter initialization uses a stable hash
+of `(training seed, module name, initialization role)`, so every shared
+parameter starts bitwise-identically across reducer variants even when a
+control adds extra modules.
+
+“Distribution” here means a structured latent representation, not calibrated
+epistemic uncertainty. Simplex terminology earns explanatory force only if the
+pre-registered geometry and disagreement predictions below survive the generic
+reducer controls.
+
+The novelty claim does not treat Aitchison geometry, ILR, opinion pools,
+products of experts, power means, or Hellinger barycenters as new. It is the
+combination of (i) identifying vanilla MoE as the exact `rho=0` Aitchison
+barycenter, (ii) exposing a continuous controlled departure from that identity,
+and (iii) testing whether the departure helps specifically when routed experts
+disagree. Without (iii), the contribution is only an implementation
+recombination and will be described as such.
+
+## 2. Common architecture, scales, and parameter count
 
 All variants use a pre-norm decoder-only transformer with RMSNorm, rotary
 position embeddings, causal scaled-dot-product attention, tied token/output
 embeddings, and SwiGLU FFNs.
 
-| field | value |
-|---|---:|
-| tokenizer | local Llama 2 tokenizer snapshot |
-| vocabulary | 32,000 |
-| layers | 12 |
-| model width | 768 |
-| attention heads | 12 |
-| maximum sequence length | 2,048 |
-| MoE layers | 6, alternating with dense layers |
-| experts per MoE layer | 16 |
-| routed expert width | 1,920 |
-| router top-k | configurable, 1–16; default 2 |
-| dense baseline FFN width | 16,320 |
+| scale | layers | width | heads | MoE layers | expert FFN | dense FFN | total parameters |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 150M | 12 | 512 | 8 | 6 | 768 | 6,528 | 149.30–149.35M |
+| 500M | 12 | 768 | 12 | 6 | 1,920 | 16,320 | 504.12–504.20M |
+| 1.5B | 16 | 1,024 | 16 | 8 | 3,328 | 28,288 | 1,490.32–1,490.45M |
+
+All use the local 32,000-token Llama 2 tokenizer, sequence length 2,048,
+16 experts per MoE layer, alternating MoE/dense layers, and default top-k=2.
+The dense/MoE total-parameter spread is below 0.04% at every scale.
 
 Ignoring small norm/router terms, a SwiGLU FFN has
 
@@ -65,8 +86,7 @@ For the dense model, choosing width 16,320 gives
 
 FFN parameters. Embedding and attention add about 53.5M parameters, producing
 504,122,112 dense parameters and 504,195,840 parameters for either MoE.
-MoE routers add only 73,728
-parameters, a difference far below 0.02%.
+MoE routers add only 73,728 parameters at 500M, a difference far below 0.02%.
 
 Total parameters are matched, but active compute deliberately differs. An MoE
 model activates approximately
@@ -78,11 +98,13 @@ model activates approximately
 parameters per token: about 107M, 133M, 186M, 292M, and 505M for top-k 1, 2,
 4, 8, and 16 respectively. The dense baseline activates all 505M. We will report
 both quality versus tokens and quality versus wall-clock/FLOPs so total-parameter
-matching is not confused with compute matching.
+matching is not confused with compute matching. The learned reducers are
+reported separately with their small parameter overhead rather than described
+as exactly matched.
 
 ## 3. Distribution space
 
-### 3.1 Ordered basis distributions
+### 3.1 Product-simplex factors
 
 For one expert and one group, let
 
@@ -92,10 +114,10 @@ p_{e,g}(u\mid x)=\sum_{j=1}^{K}\pi_{e,g,j}(x)B_j(u),
 \]
 
 where the non-negative normalized coefficients `pi` form a categorical
-distribution over an ordered dictionary of K localized basis functions. The
-basis may be understood as fixed B-spline atoms. The initial Hellinger
-aggregator acts on the coefficient distribution; an optional Wasserstein
-aggregator additionally uses the ordered atom centers as its ground metric.
+distribution over K coordinates. Hellinger and power pooling require no claim
+that these coordinates have semantic or spatial order. Only the optional
+Wasserstein experiment imposes ordered atom centers and must therefore justify
+that additional assumption.
 
 A full joint distribution is intractable, so the expert distribution is the
 product of G factors. With K=9 and G=96,
@@ -105,7 +127,13 @@ G(K-1)=96\times8=768=d_{\mathrm{model}}.
 \]
 
 Thus the product-simplex distribution has exactly the same intrinsic dimension
-as the original expert vector.
+as the original expert vector. The choice is not treated as canonical:
+`K in {5, 9, 17}` gives `G in {192, 96, 48}` at width 768 and is a mandatory
+ablation. All choices preserve `G(K-1)=d_model` and parameter count.
+Sensitivity with a reproducible optimum supports a real geometric design
+choice; flat performance across K weakens the atom interpretation and requires
+reframing the method as a generic grouped nonlinearity. Either outcome is
+reported.
 
 ### 3.2 Lossless simplex codec
 
@@ -226,7 +254,58 @@ to the simplex, adding a correction that depends jointly on how the experts
 disagree. If only expert 1 is selected, all three methods return expert 1
 exactly.
 
-### 4.5 Optional Wasserstein experiment
+### 4.5 Generic non-distributional controls
+
+The distributional interpretation is not accepted merely because one value of
+`rho` beats another. Two learned reducers directly test the “arbitrary
+nonlinearity” alternative.
+
+For the output-gated control,
+
+\[
+\tilde r_e=\operatorname{softmax}_e(\log r_e+a^Tz_e),\qquad
+y=\sum_e\tilde r_ez_e.
+\]
+
+It asks whether another content-dependent gate is sufficient. For the residual
+MLP control, define weighted mean and elementwise variance
+
+\[
+\mu=\sum_er_ez_e,\qquad
+v=\sum_er_e(z_e-\mu)^2,
+\]
+
+and use
+
+\[
+y=\mu+W_2\operatorname{SiLU}(W_1[\mu;v]).
+\]
+
+The output scorer and residual projection are zero-initialized, so both learned
+controls begin at vanilla aggregation up to floating-point roundoff. The
+bottleneck is small. These controls are
+permutation-invariant in selected-expert order and add less than 1% parameters.
+If either matches Hellinger within the pre-registered uncertainty interval, the
+paper must describe the result as evidence for nonlinear expert interaction,
+not specifically for distribution geometry.
+
+### 4.6 Learnable-rho diagnostic
+
+A layerwise scalar `rho` can be learned from an initial value of 0.5. The
+implementation uses the analytic limit around zero,
+
+\[
+\log q_\rho =
+\mathbb E_r[\log\pi]+\frac{\rho}{2}
+\operatorname{Var}_r[\log\pi]+O(\rho^2),
+\]
+
+so optimization can cross `rho=0` without a numerical singularity. We log rho
+per layer and its mean. Convergence toward zero, together with a collapsing
+correction norm, is evidence that training rejects the proposed nonlinearity;
+a stable nonzero rho is diagnostic evidence, not by itself a quality result.
+
+### 4.7 Optional Wasserstein experiment
 
 For fixed ordered centers `c_j`, define
 
@@ -240,7 +319,7 @@ barycenter behind a configuration flag, in FP32 with a small fixed iteration
 count. It is secondary because it assumes the learned groups use the imposed
 basis order meaningfully and has greater kernel/memory overhead.
 
-## 5. Routing and auxiliary objectives
+## 5. Routing, auxiliary objectives, and mechanism predictions
 
 - The router computes a softmax over 16 experts, selects configurable top-k,
   gathers those probabilities, and renormalizes them.
@@ -252,7 +331,40 @@ basis order meaningfully and has greater kernel/memory overhead.
   is enabled initially because the codec is lossless and such a penalty would
   make the comparison asymmetric.
 - We log expert load, router entropy, maximum load fraction, distribution
-  entropy, and the norm of the nonlinear correction.
+  entropy, layerwise/mean rho, and the norm of the nonlinear correction.
+
+The mechanism claim is evaluated on held-out tokens, not inferred only from
+final PPL. For selected coefficient distributions define weighted
+Jensen–Shannon disagreement
+
+\[
+D_t=\sum_er_e\operatorname{KL}\left(
+\pi_{e,t}\middle\|\sum_jr_j\pi_{j,t}\right),
+\]
+
+averaged across product factors and MoE layers. For checkpoints trained with
+the same seed and token order, define per-token gain
+
+\[
+\Delta_t=\operatorname{NLL}_{\mathrm{vanilla},t}
+          -\operatorname{NLL}_{\mathrm{distributional},t}.
+\]
+
+The pre-registered predictions are:
+
+1. Spearman correlation between `D_t` and `Delta_t` is positive.
+2. Mean gain in the highest-disagreement decile exceeds the lowest decile.
+3. The Hellinger–vanilla gap grows from top-k 1 to 2 to 4; top-k=1 is exactly
+   zero before independent training noise.
+4. Counterfactually switching a trained distributional checkpoint to geometric
+   pooling degrades high-disagreement tokens most.
+5. Router-gradient norms/directions under Hellinger differ from the geometric
+   counterfactual, and the change covaries with disagreement.
+
+A dedicated paired analysis uses identical held-out sequences, reports
+bootstrap confidence intervals and disagreement deciles, and compares router
+gradients with the auxiliary router losses excluded. These measurements decide
+whether the interaction mechanism is supported.
 
 ## 6. Tokenizer and data contract
 
@@ -269,10 +381,11 @@ worker processes. A fast tokenizer encodes documents online in bounded batches
 and continuously packs the resulting stream into 2,048-token examples.
 
 Rows are consumed in deterministic dataset order. Distributed ranks take
-disjoint contiguous row ranges, and all three model variants receive the same
-rank-local stream. The final 10,000 rows are excluded from training and reserved
-for validation. Checkpoints store the next global row, epoch, and unconsumed
-packed-token buffer, so resume reproduces the exact subsequent token batch.
+disjoint contiguous row ranges, and all compared model variants receive the
+same rank-local stream. The final 10,000 rows are excluded from training and
+reserved for validation. Checkpoints store the next global row, epoch, and
+unconsumed packed-token buffer, so resume reproduces the exact subsequent token
+batch.
 
 Startup validates tokenizer vocabulary/EOS compatibility and every produced
 token id. It also detects CPU affinity, cgroup CPU quota, and cgroup memory
@@ -300,7 +413,7 @@ The training entry point will support:
 - JSONL metrics and optional Weights & Biases logging;
 - resume and model-only initialization.
 
-At this scale all experts will initially be replicated on each GPU. This avoids
+At the current scales all experts are replicated on each GPU. This avoids
 all-to-all communication and makes non-linear selected-output aggregation
 simple. If profiling shows dispatch is the bottleneck, grouped-GEMM or a
 block-sparse backend can replace the expert loop without changing model math.
@@ -318,25 +431,48 @@ and all-reduce total negative log-likelihood and token count:
 \right).
 \]
 
-It will report PPL, mean NLL, evaluated tokens, and elapsed time.
+It reports PPL, mean NLL, evaluated tokens, elapsed time, and sequence-block
+bootstrap intervals. Mean NLL is the primary endpoint because differences are
+additive; PPL is reported for readability. Model pairs are evaluated on exactly
+the same held-out token windows.
 
 ### 8.2 Standard benchmarks
 
 An EleutherAI `lm-evaluation-harness` adapter will expose log-likelihood,
 rolling log-likelihood, and greedy generation for the custom checkpoint. The
-default suite will include:
-
-- MMLU;
-- ARC-Easy and ARC-Challenge;
-- HellaSwag;
-- PIQA;
-- WinoGrande;
-- OpenBookQA;
-- BoolQ;
-- LAMBADA OpenAI.
+pre-registered primary suite is LAMBADA OpenAI, PIQA, and HellaSwag. These are
+the most likely to provide signal at the smaller scales. MMLU, ARC-Easy,
+ARC-Challenge, WinoGrande, OpenBookQA, and BoolQ are secondary/exploratory and
+cannot rescue a failed primary result. This avoids presenting a large set of
+near-chance comparisons as independent evidence.
 
 Task prompts, few-shot defaults, and metrics remain owned by the harness. The
 exact harness version and task names will be recorded with every result.
+
+### 8.3 Pre-registered success criteria
+
+The 500M, top-k=2, Hellinger-versus-vanilla held-out NLL comparison is primary.
+The method is considered supported only if all of the following hold:
+
+1. Across seeds `{1337, 2027, 4099}`, mean NLL improves by at least 0.005
+   nats/token (about 0.5% PPL) and the 95% confidence interval of the paired
+   seed difference excludes zero.
+2. Hellinger beats both learned reducer controls by at least 0.002 nats/token,
+   or the distribution-specific claim is rejected in favor of a generic
+   nonlinear-reducer claim.
+3. Disagreement/loss-gain Spearman correlation is positive with a bootstrap
+   95% interval excluding zero, and the highest disagreement decile improves
+   more than the lowest.
+4. The Hellinger gain does not reverse at 1.5B and retains at least half of its
+   150M relative-NLL improvement.
+5. Peak memory, tokens/second, and wall-clock are reported. A result with more
+   than 25% throughput loss is not described as an unconditional efficiency
+   improvement even if quality improves.
+
+The numerical thresholds are fixed before full runs. If pilot variance implies
+that three seeds cannot resolve 0.005 nats/token, more seeds are required or
+the result is declared underpowered; thresholds are not moved after seeing the
+outcome.
 
 ## 9. Verification sequence
 
@@ -344,32 +480,58 @@ exact harness version and task names will be recorded with every result.
 2. Verify geometric distributional output and gradients match vanilla MoE.
 3. Verify top-k=1 equivalence for every power aggregator.
 4. Verify Hellinger mass, symmetry, finiteness, and gradients.
-5. Verify each 500M config's actual parameter count and the <5% contract.
-6. Run forward/backward tests with tiny CPU configurations.
-7. Run a short synthetic token training job and resume it.
-8. Run local PPL on a tiny held-out shard.
-9. Import-check the lm-eval adapter when optional dependencies are available.
-10. On the GPU system, profile 50 steps for top-k 1, 2, 4 before committing to
-    the full pretraining runs.
+5. Verify `K in {5, 9, 17}` round trips and preserves dimension/parameters.
+6. Verify learned rho is finite and differentiable through zero.
+7. Verify learned reducer permutation invariance, zero-init identity, and
+   parameter overhead below 1%.
+8. Verify 150M/500M/1.5B dense/MoE parameter contracts.
+9. Run forward/backward and BF16 tests for every reducer.
+10. Verify mechanism collection, paired token alignment, JS bounds, loss
+    deltas, and router-gradient comparison on tiny CPU models.
+11. Run a short synthetic token training job and exact resume.
+12. Run local PPL and paired analysis on a tiny held-out shard.
+13. Import-check the lm-eval adapter when optional dependencies are available.
+14. On the GPU system, profile 50 steps for every surviving reducer/top-k before
+    committing to full pretraining.
 
-## 10. Initial experiment matrix
+## 10. Staged experiment matrix
 
-Short screening uses top-k `{1, 2, 4}` and the following aggregation settings:
+Experiments are staged so the 4xA100-80GB budget is not spent on mechanisms
+that already fail cheap controls.
 
-- vanilla linear;
-- distributional geometric (`rho=0`, exact control);
-- distributional Hellinger (`rho=0.5`, primary);
-- distributional arithmetic (`rho=1`).
+### Stage A: 150M falsification screen
 
-Top-k=1 tests representation equivalence but cannot test aggregation. Quality
-will be reported against tokens, active-parameter estimates, measured
-tokens/second, and wall-clock time. Wasserstein and learned `rho` are enabled
-only after the fixed, closed-form comparisons are stable.
+- top-k `{1, 2, 4}`;
+- atom count `K={5, 9, 17}`;
+- geometric, Hellinger, arithmetic, output-gated, and residual-MLP reducers;
+- fixed versus learnable rho initialized at `{0, 0.5, 1}`;
+- seed 1337, 500M-token screen after a 100M-token pipeline pilot.
 
-All primary runs use the same micro-batch 32 per GPU, two gradient
-accumulation steps, 20B-token cap, 50,000-step cap, data split, seed, and schedule.
-The two limits are both hard stopping criteria. On one GPU, 50,000 steps at
-131,072 tokens/step process at most 6.554B tokens. On four GPUs, the 20B-token
-cap is reached after 38,147 steps at 524,288 tokens/step. Before those runs, a
-100M-token pipeline pilot and 300M-token top-k screen are used to eliminate
-broken or numerically unstable configurations.
+Only variants that are numerically stable and improve held-out NLL continue.
+
+### Stage B: scale trend
+
+Train same-seed vanilla and the selected distributional method at:
+
+| scale | tokens (20 tokens/parameter, rounded) |
+|---|---:|
+| 150M | 3B |
+| 500M | 10B |
+| 1.5B | 30B |
+
+This is the minimal three-point scale test. The existing 500M/20B configuration
+is a longer follow-up, not substituted for the matched tokens-per-parameter
+curve.
+
+### Stage C: variance and strong controls
+
+At 500M/top-k=2, run vanilla, Hellinger, output-gated, and residual-MLP with
+seeds `{1337, 2027, 4099}`. If cost forces sequential decisions, three vanilla
+seeds first estimate the noise floor; the Hellinger and learned-control
+replicates proceed only when the pilot effect exceeds the pre-registered
+minimum detectable effect.
+
+Every comparison records resolved config, exact parameters, data position,
+tokens, peak allocated/reserved memory, tokens/second, wall-clock, held-out NLL,
+primary benchmarks, correction norm/rho trajectory, and paired mechanism
+statistics. Negative outcomes narrow the claim rather than being hidden.

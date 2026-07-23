@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import math
 from typing import Any
 
@@ -9,7 +10,13 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .config import ModelConfig
-from .moe import SparseMoE, SwiGLU
+from .moe import (
+    OutputGatedAggregator,
+    ResidualMLPAggregator,
+    SparseMoE,
+    SwiGLU,
+)
+from .simplex import DistributionAggregator
 
 
 class RMSNorm(nn.Module):
@@ -105,7 +112,7 @@ class TransformerBlock(nn.Module):
 
     def forward(
         self, inputs: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, ...]:
         hidden = inputs + self.attention(self.attention_norm(inputs))
         if self.is_moe:
             ffn_output, auxiliary_loss, metrics = self.ffn(self.ffn_norm(hidden))
@@ -119,6 +126,8 @@ class TransformerBlock(nn.Module):
                 "max_load_fraction": zero,
                 "distribution_entropy": zero,
                 "nonlinear_correction_ratio": zero,
+                "aggregation_rho": zero,
+                "expert_js_divergence": zero,
             }
         hidden = hidden + ffn_output
         return (
@@ -129,6 +138,8 @@ class TransformerBlock(nn.Module):
             metrics["max_load_fraction"],
             metrics["distribution_entropy"],
             metrics["nonlinear_correction_ratio"],
+            metrics["aggregation_rho"],
+            metrics["expert_js_divergence"],
         )
 
 
@@ -145,26 +156,62 @@ class DecoderLM(nn.Module):
         self.lm_head = None
         if not config.tie_embeddings:
             self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-        self.apply(self._initialize_module)
-        self._initialize_residual_projections()
+        self._initialize_parameters()
 
-    @staticmethod
-    def _initialize_module(module: nn.Module) -> None:
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    def _module_seed(self, name: str, purpose: str) -> int:
+        payload = (
+            f"{self.config.initialization_seed}:{name}:{purpose}"
+        ).encode("utf-8")
+        digest = hashlib.blake2b(payload, digest_size=8).digest()
+        return int.from_bytes(digest, "little") % (2**63 - 1)
 
-    def _initialize_residual_projections(self) -> None:
+    def _normal_weight(
+        self, module: nn.Module, name: str, standard_deviation: float
+    ) -> None:
+        weight = module.weight
+        if weight.device.type == "meta":
+            nn.init.normal_(weight, mean=0.0, std=standard_deviation)
+            return
+        generator = torch.Generator(device=weight.device)
+        generator.manual_seed(self._module_seed(name, "normal"))
+        nn.init.normal_(
+            weight,
+            mean=0.0,
+            std=standard_deviation,
+            generator=generator,
+        )
+
+    def _initialize_parameters(self) -> None:
+        for name, module in self.named_modules():
+            if isinstance(module, (nn.Linear, nn.Embedding)):
+                self._normal_weight(module, name, 0.02)
+
         residual_std = 0.02 / math.sqrt(2 * self.config.n_layers)
-        for block in self.blocks:
-            nn.init.normal_(block.attention.out_proj.weight, mean=0.0, std=residual_std)
+        for block_index, block in enumerate(self.blocks):
+            self._normal_weight(
+                block.attention.out_proj,
+                f"blocks.{block_index}.attention.out_proj.residual",
+                residual_std,
+            )
             if block.is_moe:
-                for expert in block.ffn.experts:
-                    nn.init.normal_(
-                        expert.down_proj.weight, mean=0.0, std=residual_std
+                for expert_index, expert in enumerate(block.ffn.experts):
+                    self._normal_weight(
+                        expert.down_proj,
+                        (
+                            f"blocks.{block_index}.ffn.experts."
+                            f"{expert_index}.down_proj.residual"
+                        ),
+                        residual_std,
                     )
+                if isinstance(block.ffn.aggregator, ResidualMLPAggregator):
+                    block.ffn.aggregator.zero_initialize_output()
+                if isinstance(block.ffn.aggregator, OutputGatedAggregator):
+                    block.ffn.aggregator.zero_initialize_score()
             else:
-                nn.init.normal_(
-                    block.ffn.down_proj.weight, mean=0.0, std=residual_std
+                self._normal_weight(
+                    block.ffn.down_proj,
+                    f"blocks.{block_index}.ffn.down_proj.residual",
+                    residual_std,
                 )
 
     def set_top_k(self, top_k: int) -> None:
@@ -174,6 +221,47 @@ class DecoderLM(nn.Module):
         for block in self.blocks:
             if block.is_moe:
                 block.ffn.set_top_k(top_k)
+
+    def set_mechanism_collection(self, enabled: bool) -> None:
+        if self.config.model_type != "distributional_moe" and enabled:
+            raise ValueError(
+                "token-level mechanism collection requires distributional_moe"
+            )
+        for block in self.blocks:
+            if block.is_moe:
+                block.ffn.set_collect_mechanism_metrics(enabled)
+
+    def mechanism_snapshot(self) -> dict[str, Any]:
+        token_metrics: dict[str, list[torch.Tensor]] = {
+            "expert_js_divergence": [],
+            "nonlinear_correction_ratio": [],
+        }
+        router_logits: list[torch.Tensor] = []
+        for block in self.blocks:
+            if not block.is_moe:
+                continue
+            if block.ffn.last_router_logits is not None:
+                router_logits.append(block.ffn.last_router_logits)
+            aggregator = block.ffn.aggregator
+            if isinstance(aggregator, DistributionAggregator):
+                for name in token_metrics:
+                    value = aggregator.last_token_metrics.get(name)
+                    if value is not None:
+                        token_metrics[name].append(value)
+        result: dict[str, Any] = {"router_logits": router_logits}
+        for name, values in token_metrics.items():
+            if values:
+                result[name] = torch.stack(values, dim=0).mean(dim=0)
+        return result
+
+    def aggregation_rho_values(self) -> list[float]:
+        values: list[float] = []
+        for block in self.blocks:
+            if block.is_moe and isinstance(
+                block.ffn.aggregator, DistributionAggregator
+            ):
+                values.append(block.ffn.aggregator.reported_rho())
+        return values
 
     def parameter_report(self) -> dict[str, int | float]:
         total = sum(parameter.numel() for parameter in self.parameters())
@@ -201,7 +289,7 @@ class DecoderLM(nn.Module):
         if input_ids.shape[1] > self.config.max_seq_len:
             raise ValueError("input sequence exceeds model max_seq_len")
         hidden = self.token_embedding(input_ids)
-        metric_sums = [hidden.new_zeros((), dtype=torch.float32) for _ in range(5)]
+        metric_sums = [hidden.new_zeros((), dtype=torch.float32) for _ in range(7)]
         auxiliary_loss = hidden.new_zeros((), dtype=torch.float32)
         moe_layer_count = 0
 
@@ -214,7 +302,7 @@ class DecoderLM(nn.Module):
             auxiliary_loss = auxiliary_loss + outputs[1]
             if block.is_moe:
                 moe_layer_count += 1
-                for index in range(5):
+                for index in range(7):
                     metric_sums[index] = metric_sums[index] + outputs[index + 2]
 
         hidden = self.final_norm(hidden)
@@ -238,6 +326,8 @@ class DecoderLM(nn.Module):
             "max_load_fraction",
             "distribution_entropy",
             "nonlinear_correction_ratio",
+            "aggregation_rho",
+            "expert_js_divergence",
         ]
         metrics = {
             name: value / divisor for name, value in zip(metric_names, metric_sums)
@@ -277,4 +367,3 @@ class DecoderLM(nn.Module):
                     break
         self.train(was_training)
         return generated
-

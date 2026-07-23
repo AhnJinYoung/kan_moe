@@ -8,6 +8,80 @@ from .config import ModelConfig
 from .simplex import DistributionAggregator
 
 
+def _reducer_metrics(
+    reference: torch.Tensor, correction_ratio: torch.Tensor
+) -> dict[str, torch.Tensor]:
+    zero = reference.new_zeros((), dtype=torch.float32)
+    return {
+        "distribution_entropy": zero,
+        "nonlinear_correction_ratio": correction_ratio,
+        "aggregation_rho": zero,
+        "expert_js_divergence": zero,
+    }
+
+
+class OutputGatedAggregator(nn.Module):
+    """Learn a second content-dependent gate over selected expert outputs."""
+
+    def __init__(self, d_model: int) -> None:
+        super().__init__()
+        self.score = nn.Linear(d_model, 1, bias=False)
+        self.scale = d_model**-0.5
+
+    def zero_initialize_score(self) -> None:
+        nn.init.zeros_(self.score.weight)
+
+    def forward(
+        self, selected_outputs: torch.Tensor, router_weights: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        linear_output = (
+            selected_outputs * router_weights.to(selected_outputs.dtype)[..., None]
+        ).sum(dim=1)
+        score = self.score(selected_outputs).squeeze(-1).float() * self.scale
+        learned_weights = F.softmax(
+            router_weights.float().clamp_min(1e-12).log() + score,
+            dim=-1,
+        ).to(selected_outputs.dtype)
+        output = (selected_outputs * learned_weights[..., None]).sum(dim=1)
+        correction = (output.float() - linear_output.float()).norm(dim=-1)
+        baseline = linear_output.float().norm(dim=-1).clamp_min(1e-6)
+        return output, _reducer_metrics(
+            selected_outputs, (correction / baseline).mean()
+        )
+
+
+class ResidualMLPAggregator(nn.Module):
+    """Permutation-invariant learned reducer over selected-output moments."""
+
+    def __init__(self, d_model: int, hidden_dim: int) -> None:
+        super().__init__()
+        self.up = nn.Linear(2 * d_model, hidden_dim, bias=False)
+        self.down = nn.Linear(hidden_dim, d_model, bias=False)
+
+    def zero_initialize_output(self) -> None:
+        nn.init.zeros_(self.down.weight)
+
+    def forward(
+        self, selected_outputs: torch.Tensor, router_weights: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        weights = router_weights.to(selected_outputs.dtype)[..., None]
+        mean = (selected_outputs * weights).sum(dim=1)
+        if selected_outputs.shape[1] == 1:
+            correction = torch.zeros_like(mean)
+        else:
+            variance = (
+                weights * (selected_outputs - mean[:, None, :]).square()
+            ).sum(dim=1)
+            features = torch.cat((mean, variance), dim=-1)
+            correction = self.down(F.silu(self.up(features)))
+        output = mean + correction
+        correction_norm = correction.float().norm(dim=-1)
+        baseline = mean.float().norm(dim=-1).clamp_min(1e-6)
+        return output, _reducer_metrics(
+            selected_outputs, (correction_norm / baseline).mean()
+        )
+
+
 class SwiGLU(nn.Module):
     def __init__(self, d_model: int, hidden_dim: int, dropout: float = 0.0) -> None:
         super().__init__()
@@ -48,9 +122,25 @@ class SparseMoE(nn.Module):
                 distribution_k=config.distribution_k,
                 method=config.aggregation,
                 power_rho=config.power_rho,
+                learnable_rho=config.learnable_rho,
+                rho_limit=config.rho_limit,
                 sinkhorn_epsilon=config.sinkhorn_epsilon,
                 sinkhorn_iterations=config.sinkhorn_iterations,
             )
+        elif config.model_type == "output_gated_moe":
+            self.aggregator = OutputGatedAggregator(config.d_model)
+        elif config.model_type == "residual_mlp_moe":
+            self.aggregator = ResidualMLPAggregator(
+                config.d_model, config.reducer_hidden_dim
+            )
+        self.collect_mechanism_metrics = False
+        self.last_router_logits: torch.Tensor | None = None
+
+    def set_collect_mechanism_metrics(self, enabled: bool) -> None:
+        self.collect_mechanism_metrics = enabled
+        self.last_router_logits = None
+        if isinstance(self.aggregator, DistributionAggregator):
+            self.aggregator.set_collect_token_metrics(enabled)
 
     def set_top_k(self, top_k: int) -> None:
         if not 1 <= top_k <= self.n_experts:
@@ -105,6 +195,9 @@ class SparseMoE(nn.Module):
             router_inputs = router_inputs * noise
 
         router_logits = self.router(router_inputs)
+        self.last_router_logits = (
+            router_logits if self.collect_mechanism_metrics else None
+        )
         router_probabilities = F.softmax(router_logits.float(), dim=-1)
         router_weights, expert_indices = torch.topk(
             router_probabilities, k=self.top_k, dim=-1
@@ -124,6 +217,8 @@ class SparseMoE(nn.Module):
                 "nonlinear_correction_ratio": flat_inputs.new_zeros(
                     (), dtype=torch.float32
                 ),
+                "aggregation_rho": flat_inputs.new_zeros((), dtype=torch.float32),
+                "expert_js_divergence": flat_inputs.new_zeros((), dtype=torch.float32),
             }
         else:
             flat_output, distribution_metrics = self.aggregator(
@@ -156,6 +251,10 @@ class SparseMoE(nn.Module):
             "distribution_entropy": distribution_metrics["distribution_entropy"],
             "nonlinear_correction_ratio": distribution_metrics[
                 "nonlinear_correction_ratio"
+            ],
+            "aggregation_rho": distribution_metrics["aggregation_rho"],
+            "expert_js_divergence": distribution_metrics[
+                "expert_js_divergence"
             ],
         }
         return flat_output.reshape(original_shape), auxiliary_loss, metrics

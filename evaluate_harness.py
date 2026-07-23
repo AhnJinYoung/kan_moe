@@ -6,10 +6,12 @@ import json
 from pathlib import Path
 
 
-DEFAULT_TASKS = (
-    "mmlu,arc_easy,arc_challenge,hellaswag,piqa,winogrande,"
-    "openbookqa,boolq,lambada_openai"
-)
+TASK_SUITES = {
+    "primary": "lambada_openai,piqa,hellaswag",
+    "secondary": (
+        "mmlu,arc_easy,arc_challenge,winogrande,openbookqa,boolq"
+    ),
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -18,7 +20,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--tokenizer", required=True)
-    parser.add_argument("--tasks", default=DEFAULT_TASKS)
+    parser.add_argument(
+        "--suite",
+        choices=("primary", "secondary", "all"),
+        default="primary",
+        help="Pre-registered primary tasks are the default; secondary tasks are exploratory.",
+    )
+    parser.add_argument(
+        "--tasks",
+        default="",
+        help="Explicit comma-separated tasks; overrides --suite.",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--top-k", type=int, default=None)
@@ -51,9 +63,17 @@ def main() -> None:
         top_k=args.top_k,
         precision=args.precision,
     )
+    task_spec = args.tasks
+    if not task_spec:
+        task_spec = TASK_SUITES["primary"]
+        if args.suite in {"secondary", "all"}:
+            secondary = TASK_SUITES["secondary"]
+            task_spec = (
+                secondary if args.suite == "secondary" else f"{task_spec},{secondary}"
+            )
     results = lm_eval.simple_evaluate(
         model=model,
-        tasks=[task.strip() for task in args.tasks.split(",") if task.strip()],
+        tasks=[task.strip() for task in task_spec.split(",") if task.strip()],
         num_fewshot=args.num_fewshot,
         batch_size=args.batch_size,
         device=args.device,
@@ -75,6 +95,8 @@ def main() -> None:
         "tokenizer_manifest": tokenizer_manifest,
         "lm_eval_version": importlib.metadata.version("lm-eval"),
         "transformers_version": importlib.metadata.version("transformers"),
+        "evaluation_suite": args.suite if not args.tasks else "explicit",
+        "primary_tasks": TASK_SUITES["primary"].split(","),
     }
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)

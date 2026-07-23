@@ -9,9 +9,10 @@ tokenizer:   /data/umoe_mod_share/llama2_tokenizer
 outputs:     /data/umoe_mod_share/kan_moe/outputs
 ```
 
-모든 비교군은 동일한 tokenizer snapshot, 데이터 split, seed, global batch,
-20B-token 상한과 50,000-step 상한을 사용한다. 아래 명령은 저장소 루트에서
-실행한다.
+각 비교 안에서 모든 모델은 동일한 tokenizer snapshot, 데이터 split, seed,
+global batch와 token budget을 사용한다. 500M 장기 YAML은 20B/50,000-step
+상한을 유지하고, scale curve는 150M/3B, 500M/10B, 1.5B/30B로 별도
+pre-register한다. 아래 명령은 저장소 루트에서 실행한다.
 
 ## 1. 환경 준비
 
@@ -119,165 +120,198 @@ direct`가 기록되며 `Generating train split`이 나타나지 않는다. 그 
 ```bash
 python3 -m unittest discover -s tests -v
 python3 scripts/count_parameters.py \
+  configs/dense_150m.yaml \
+  configs/vanilla_moe_150m.yaml \
+  configs/distributional_moe_150m.yaml \
   configs/dense_500m.yaml \
   configs/vanilla_moe_500m.yaml \
-  configs/distributional_moe_500m.yaml
+  configs/distributional_moe_500m.yaml \
+  configs/output_gated_moe_500m.yaml \
+  configs/residual_mlp_moe_500m.yaml \
+  configs/dense_1_5b.yaml \
+  configs/vanilla_moe_1_5b.yaml \
+  configs/distributional_moe_1_5b.yaml
 ```
 
-기대값은 dense `504,122,112`, vanilla MoE와 distributional MoE 각각
-`504,195,840`이다. 두 MoE의 total parameter 수는 정확히 같고, dense와의
-차이는 약 0.015%이다.
+Dense/vanilla/distributional 기대값은 각각 150M scale에서
+`149,303,808 / 149,352,960 / 149,352,960`, 500M에서
+`504,122,112 / 504,195,840 / 504,195,840`, 1.5B에서
+`1,490,322,432 / 1,490,453,504 / 1,490,453,504`이다. 각 scale의
+dense–MoE 오차는 0.04% 미만이고 vanilla와 fixed distributional은 정확히
+같다. 500M output-gated는 `504,200,448`, residual-MLP는 `505,080,576`으로
+각각 vanilla 대비 약 0.001%, 0.176% 추가된다.
 
-## 4. 100M-token 파이프라인 pilot
+## 4. 100M-token pilot
 
-먼저 Hellinger 모델로 데이터, DDP, validation, checkpoint/resume을 끝까지
-검증한다. 네 GPU에서 optimizer step당 524,288 tokens이므로 약 191 steps다.
+실험 matrix 도구는 기본적으로 명령만 출력하며 `--execute`를 붙여야 실제로
+순차 실행한다. 먼저 150M Hellinger로 data/DDP/eval/checkpoint를 검증한다.
 
 ```bash
-unset CUDA_VISIBLE_DEVICES
-torchrun --standalone --nproc_per_node=4 train.py \
-  --config configs/distributional_moe_500m.yaml \
-  --override train.max_tokens=100000000 \
-  --override train.eval_interval=100 \
-  --override train.save_interval=100 \
-  --override train.output_dir=/data/umoe_mod_share/kan_moe/outputs/pilot_dmoe_k2
+python3 scripts/experiment_matrix.py \
+  --stage pilot \
+  --nproc-per-node 4
+
+python3 scripts/experiment_matrix.py \
+  --stage pilot \
+  --nproc-per-node 4 \
+  --execute
 ```
 
-resume 검증:
+중단된 단일 run은 출력된 명령 끝에 `--override train.resume=latest`를 붙인다.
+
+전체 run 전에 500M controls와 1.5B 모델을 각각 50 step profiling해 OOM,
+throughput, peak allocated/reserved memory를 확인한다.
 
 ```bash
-torchrun --standalone --nproc_per_node=4 train.py \
-  --config configs/distributional_moe_500m.yaml \
-  --override train.max_tokens=200000000 \
-  --override train.resume=latest \
-  --override train.output_dir=/data/umoe_mod_share/kan_moe/outputs/pilot_dmoe_k2
+python3 scripts/experiment_matrix.py \
+  --stage profiling \
+  --nproc-per-node 4
+
+# 출력 명령 검토 후 --execute
 ```
 
-## 5. top-k 및 aggregator screening
+## 5. 150M falsification screening
 
-`model.top_k`는 1부터 16까지 바꿀 수 있고 parameter 수는 변하지 않는다.
-top-k=1은 aggregate가 발생하지 않으므로 codec 동등성 확인용이지, 제안한
-aggregation 효과를 판단하는 실험은 아니다. 먼저 `{1,2,4}`를 300M tokens로
-screen한다.
-
-```bash
-for K in 1 2 4; do
-  torchrun --standalone --nproc_per_node=4 train.py \
-    --config configs/distributional_moe_500m.yaml \
-    --override model.top_k=${K} \
-    --override train.max_tokens=300000000 \
-    --override train.output_dir=/data/umoe_mod_share/kan_moe/outputs/screen_dmoe_hellinger_k${K}
-done
-```
-
-top-k=2에서 수학적 negative control과 다른 pool을 비교한다.
-
-```bash
-for AGG in geometric hellinger arithmetic; do
-  torchrun --standalone --nproc_per_node=4 train.py \
-    --config configs/distributional_moe_500m.yaml \
-    --override model.top_k=2 \
-    --override model.aggregation=${AGG} \
-    --override train.max_tokens=300000000 \
-    --override train.output_dir=/data/umoe_mod_share/kan_moe/outputs/screen_dmoe_${AGG}_k2
-done
-```
-
-`geometric`은 ILR 공간에서 vanilla linear sum과 output/gradient가 정확히
-동등한 control이다. primary 후보는 `hellinger`다.
-
-## 6. 주 비교
-
-한 번에 하나씩 실행한다. YAML의 기본값은 모두 micro-batch 32/GPU,
-gradient accumulation 2, `max_steps: 50000`, `max_tokens: 20B`, seed
-1337이다. 한 GPU에서는 optimizer step당 131,072 tokens이므로 50,000-step
-상한이 먼저 적용되어 최대 6.554B tokens를 학습한다. 네 GPU에서는 optimizer
-step당 524,288 tokens이며 20B-token 상한이 먼저 적용되어 38,147 steps를
-학습한다. 한 GPU로 실제 20B tokens를 모두 학습하려면 `max_steps`를 최소
-152,588로 높여야 한다. 세 모델은 같은 row order와 online packing 규칙을
+다음 stage는 500M tokens에서 vanilla/Hellinger top-k `{1,2,4}`, simplex atom count
+`K={5,9,17}`, geometric/Hellinger/arithmetic, learned output gate,
+permutation-invariant residual MLP, learnable rho 초기값 `{0,0.5,1}`를 비교한다.
+`K=9`, top-k=2 Hellinger run은 중복 실행하지 않고 각 sweep의 공통 기준으로
 사용한다.
 
-단일 A100용 micro-batch와 accumulation은 YAML에 설정되어 있다고 가정한다.
-
 ```bash
-unset CUDA_VISIBLE_DEVICES
-torchrun --standalone --nproc_per_node=1 train.py \
-  --config configs/distributional_moe_500m.yaml \
-  --override train.wandb_project=kan-moe \
-  --override train.wandb_run_name=dmoe-hellinger-k2-50k-1gpu
+python3 scripts/experiment_matrix.py \
+  --stage screening \
+  --nproc-per-node 4
+
+# 명령을 검토한 뒤에만 실행
+python3 scripts/experiment_matrix.py \
+  --stage screening \
+  --nproc-per-node 4 \
+  --execute
 ```
 
-아래는 네 GPU 비교 명령이다.
+`geometric`은 vanilla와 output/gradient가 정확히 같은 항등 control이다.
+Hellinger가 learned gate 또는 residual MLP와 통계적으로 구분되지 않으면
+distribution-specific claim을 포기하고 generic nonlinear reducer 결과로
+해석한다.
+
+## 6. scale 및 seed 비교
+
+Scale stage는 20 tokens/parameter에 맞춰 150M/3B, 500M/10B, 1.5B/30B를
+dense, vanilla, Hellinger에 대해 seed 1337로 실행한다. Seed stage는
+500M/10B에서 vanilla, Hellinger, output-gated, residual-MLP를
+`{1337,2027,4099}`로 실행한다.
 
 ```bash
-torchrun --standalone --nproc_per_node=4 train.py \
-  --config configs/dense_500m.yaml
+python3 scripts/experiment_matrix.py --stage scaling --nproc-per-node 4
+python3 scripts/experiment_matrix.py --stage seeds --nproc-per-node 4
 
-torchrun --standalone --nproc_per_node=4 train.py \
-  --config configs/vanilla_moe_500m.yaml
-
-torchrun --standalone --nproc_per_node=4 train.py \
-  --config configs/distributional_moe_500m.yaml
+# 앞 단계가 성공 기준을 통과한 후 각각 --execute 추가
 ```
 
-중단된 run은 해당 명령에 `--override train.resume=latest`를 추가한다.
-`metrics.jsonl`에는 tokens/sec, NLL/PPL, router entropy/load, distribution
-entropy, nonlinear correction ratio가 기록된다. quality-vs-token뿐 아니라
-wall-clock과 throughput도 함께 보고한다.
+500M 기본 YAML은 요청한 장기 설정인 micro-batch 32/GPU, accumulation 2,
+`max_steps=50000`, `max_tokens=20B`를 유지한다. 한 GPU에서는 50k-step
+제한으로 6.554B에서 끝나고 네 GPU에서는 20B 제한으로 38,147 step에서
+끝난다. Matrix 도구는 scale/seed 비교 시 500M을 10B와 충분한 max step으로
+명시적으로 override한다.
 
-## 7. held-out perplexity
+학습 로그에는 NLL/PPL, router load/entropy, correction ratio, learnable rho,
+tokens/sec와 CUDA allocated/reserved peak memory가 포함된다.
 
-각 run의 최신 checkpoint를 찾아 validation split의 10M tokens에서 PPL을
-계산한다. 세 모델에서 `--max-tokens`, sequence length, GPU 수를 동일하게
-유지한다.
+## 7. held-out perplexity와 seed 통계
+
+각 run은 동일한 validation 10M tokens에서 평가한다. 결과에는 sequence-block
+bootstrap NLL/PPL 95% interval이 포함된다.
 
 ```bash
-RUN=/data/umoe_mod_share/kan_moe/outputs/distributional_moe_500m_k2
+RUN=/data/umoe_mod_share/kan_moe/outputs/revised/seed-500m-hellinger-seed1337
 CKPT=$(ls -1 "${RUN}"/step_*.pt | sort | tail -n 1)
 
 torchrun --standalone --nproc_per_node=4 evaluate_ppl.py \
   --checkpoint "${CKPT}" \
   --max-tokens 10000000 \
   --batch-size 4 \
+  --bootstrap-iters 1000 \
   --output "${RUN}/ppl_10m.json"
 ```
 
-다른 top-k를 checkpoint에 사후 적용하는 `--top-k` 옵션은 진단용이다.
-primary score는 학습에 사용한 top-k로 계산한다.
-
-## 8. MMLU, ARC, HellaSwag 등 benchmark
-
-benchmark는 한 GPU에서 실행한다. `lm-eval==0.4.12`를 세 모델 모두에
-고정하고 task별 harness 기본 few-shot 설정을 유지한다. 결과 JSON에 task
-설정과 metric이 함께 저장된다.
+세 seed 결과가 준비되면 같은 seed끼리 paired NLL 차이와 noise floor를
+계산한다.
 
 ```bash
-export CUDA_VISIBLE_DEVICES=0
-RUN=/data/umoe_mod_share/kan_moe/outputs/distributional_moe_500m_k2
-CKPT=$(ls -1 "${RUN}"/step_*.pt | sort | tail -n 1)
+# candidate 실행 전 baseline noise floor와 MDE 추정
+python3 scripts/summarize_seeds.py \
+  --baseline /path/to/vanilla_seed1337.json /path/to/vanilla_seed2027.json /path/to/vanilla_seed4099.json
 
+# same-seed paired 비교
+python3 scripts/summarize_seeds.py \
+  --baseline /path/to/vanilla_seed1337.json /path/to/vanilla_seed2027.json /path/to/vanilla_seed4099.json \
+  --candidate /path/to/hellinger_seed1337.json /path/to/hellinger_seed2027.json /path/to/hellinger_seed4099.json \
+  --output /path/to/hellinger_vs_vanilla_seed_summary.json
+```
+
+사전 성공 기준은 mean NLL 0.005 nats/token 이상 개선 및 paired seed 95% CI가
+0을 제외하는 것이다.
+
+## 8. disagreement–loss 및 router-gradient 분석
+
+같은 seed/data order로 학습한 distributional/vanilla checkpoint를 짝지어
+token별 weighted JS disagreement와 NLL gain의 상관, disagreement decile,
+trained distributional checkpoint를 geometric으로 바꾼 counterfactual,
+router gradient norm/direction 변화를 계산한다.
+
+```bash
+python3 analyze_mechanism.py \
+  --checkpoint /path/to/distributional_step.pt \
+  --baseline-checkpoint /path/to/same_seed_vanilla_step.pt \
+  --max-tokens 1000000 \
+  --batch-size 1 \
+  --router-gradient-batches 8 \
+  --bootstrap-iters 1000 \
+  --device cuda:0 \
+  --output /path/to/mechanism_analysis.json
+```
+
+Router-gradient 분석은 메모리가 크므로 우선 8 batch만 사용한다. 보고할 핵심은
+disagreement–gain Spearman CI, 최고/최저 disagreement decile의 gain 차이,
+counterfactual gain, Hellinger/geometric router-gradient cosine이다.
+
+## 9. benchmark
+
+Primary suite는 LAMBADA OpenAI, PIQA, HellaSwag이다. MMLU, ARC,
+WinoGrande, OpenBookQA, BoolQ는 작은 scale에서 near-chance일 수 있으므로
+secondary/exploratory로 분리한다.
+
+```bash
 python3 evaluate_harness.py \
-  --checkpoint "${CKPT}" \
+  --checkpoint /path/to/step.pt \
   --tokenizer /data/umoe_mod_share/llama2_tokenizer \
-  --tasks mmlu,arc_easy,arc_challenge,hellaswag,piqa,winogrande,openbookqa,boolq,lambada_openai \
+  --suite primary \
   --device cuda:0 \
   --batch-size 8 \
   --bootstrap-iters 1000 \
   --cache-requests \
-  --output "${RUN}/benchmarks.json"
+  --output /path/to/primary_benchmarks.json
+
+python3 evaluate_harness.py \
+  --checkpoint /path/to/step.pt \
+  --tokenizer /data/umoe_mod_share/llama2_tokenizer \
+  --suite secondary \
+  --device cuda:0 \
+  --batch-size 8 \
+  --output /path/to/secondary_benchmarks.json
 ```
 
-메모리가 부족하면 benchmark의 `--batch-size`만 4 또는 2로 낮춘다. 모델
-점수에는 영향을 주지 않고 처리량만 달라진다. 빠른 연결 검증에는
-`--limit 0.01`을 추가하되, 보고할 최종 결과에는 `--limit`을 사용하지 않는다.
+빠른 연결 검증에서만 `--limit 0.01`을 사용한다. 최종 결과에서는 쓰지 않는다.
 
-## 9. 비교 시 반드시 고정·기록할 항목
+## 10. 비교 시 반드시 고정·기록할 항목
 
 - local Llama 2 tokenizer 파일과 vocab/EOS 계약
 - raw Parquet 목록, row/row-group layout, direct-streaming batch 제한
 - cgroup CPU/memory limit과 실제 native/PyTorch thread 수
 - train/validation row 경계와 online packing 정책
 - tokens seen, seed, sequence length, global batch, optimizer schedule
+- stable name-based initialization seed와 shared-weight identity
 - total parameters와 top-k별 active parameters
 - PPL token count와 benchmark harness version/task configuration
 - A100 수, peak memory, wall-clock, tokens/sec
