@@ -10,7 +10,8 @@ outputs:     /data/umoe_mod_share/kan_moe/outputs
 ```
 
 모든 비교군은 동일한 tokenizer snapshot, 데이터 split, seed, global batch,
-5B-token budget을 사용한다. 아래 명령은 저장소 루트에서 실행한다.
+2B-token budget과 50,000-step 상한을 사용한다. 아래 명령은 저장소 루트에서
+실행한다.
 
 ## 1. 환경 준비
 
@@ -185,13 +186,14 @@ done
 `geometric`은 ILR 공간에서 vanilla linear sum과 output/gradient가 정확히
 동등한 control이다. primary 후보는 `hellinger`다.
 
-## 6. 5B-token 주 비교
+## 6. 2B-token 주 비교
 
 한 번에 하나씩 실행한다. YAML의 기본값은 모두 micro-batch 2/GPU,
-gradient accumulation 32, 5B tokens, seed 1337이다. `max_steps: 0`이므로
-GPU 수와 무관하게 `max_tokens`가 종료 조건이다. 한 GPU에서는 optimizer
-step당 131,072 tokens로 38,147 steps, 네 GPU에서는 524,288 tokens로
-9,537 steps다. 세 모델은 같은 row order와 online packing 규칙을 사용한다.
+gradient accumulation 32, `max_steps: 50000`, 2B tokens, seed 1337이다.
+현재 batch에서는 `max_tokens`가 먼저 종료 조건이 된다. 한 GPU에서는
+optimizer step당 131,072 tokens로 15,259 steps, 네 GPU에서는 524,288
+tokens로 3,815 steps다. 세 모델은 같은 row order와 online packing 규칙을
+사용한다.
 
 단일 A100용 micro-batch와 accumulation은 YAML에 설정되어 있다고 가정한다.
 
@@ -200,7 +202,7 @@ unset CUDA_VISIBLE_DEVICES
 torchrun --standalone --nproc_per_node=1 train.py \
   --config configs/distributional_moe_500m.yaml \
   --override train.wandb_project=kan-moe \
-  --override train.wandb_run_name=dmoe-hellinger-k2-5b-1gpu
+  --override train.wandb_run_name=dmoe-hellinger-k2-2b-1gpu
 ```
 
 아래는 네 GPU 비교 명령이다.

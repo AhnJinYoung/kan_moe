@@ -366,8 +366,9 @@ will be reported against tokens, active-parameter estimates, measured
 tokens/second, and wall-clock time. Wasserstein and learned `rho` are enabled
 only after the fixed, closed-form comparisons are stable.
 
-All primary runs use the same 5B-token budget, data split, seed, and schedule.
-This is 38,147 optimizer steps on one GPU (131,072 tokens/step) or 9,537 steps
-on four GPUs (524,288 tokens/step). Before those runs, a 100M-token pipeline
-pilot and 300M-token top-k screen are used to eliminate broken or numerically
-unstable configurations.
+All primary runs use the same 2B-token budget, 50,000-step safety cap, data
+split, seed, and schedule. The token limit is reached after 15,259 optimizer
+steps on one GPU (131,072 tokens/step) or 3,815 steps on four GPUs (524,288
+tokens/step). Before those runs, a 100M-token pipeline pilot and 300M-token
+top-k screen are used to eliminate broken or numerically unstable
+configurations.
