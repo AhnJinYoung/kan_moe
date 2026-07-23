@@ -4,9 +4,27 @@ import argparse
 import contextlib
 import json
 import math
+import os
+import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable
+
+from dmoe.gpu_select import GPUSelection, configure_cuda_visibility
+
+
+def _automatic_gpu_selection_enabled() -> bool:
+    disabled_by_cli = "--no-auto-select-gpu" in sys.argv
+    disabled_by_environment = os.environ.get(
+        "DMOE_AUTO_SELECT_GPU", "1"
+    ).lower() in {"0", "false", "no", "off"}
+    return not disabled_by_cli and not disabled_by_environment
+
+
+GPU_SELECTION: GPUSelection = configure_cuda_visibility(
+    enabled=_automatic_gpu_selection_enabled()
+)
 
 import torch
 import torch.distributed as dist
@@ -41,6 +59,14 @@ from dmoe.model import DecoderLM
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a dense or MoE decoder LM")
     parser.add_argument("--config", required=True, help="YAML experiment config")
+    parser.add_argument(
+        "--no-auto-select-gpu",
+        action="store_true",
+        help=(
+            "Disable idle-GPU discovery. An existing CUDA_VISIBLE_DEVICES value "
+            "is always respected regardless of this flag."
+        ),
+    )
     parser.add_argument(
         "--override",
         action="append",
@@ -137,7 +163,11 @@ def evaluate_validation(
     }
 
 
-def maybe_initialize_wandb(config: ExperimentConfig, context: DistributedContext) -> Any:
+def maybe_initialize_wandb(
+    config: ExperimentConfig,
+    context: DistributedContext,
+    runtime_info: dict[str, Any],
+) -> Any:
     if not context.is_main or not config.train.wandb_project:
         return None
     try:
@@ -147,15 +177,39 @@ def maybe_initialize_wandb(config: ExperimentConfig, context: DistributedContext
     return wandb.init(
         project=config.train.wandb_project,
         name=config.train.wandb_run_name or None,
-        config=config.to_dict(),
+        config={**config.to_dict(), "runtime": runtime_info},
     )
 
 
 def main() -> None:
     args = parse_args()
     config = load_experiment_config(args.config, args.override)
+    expects_cuda = GPU_SELECTION.auto_selected or (
+        GPU_SELECTION.mode == "explicit"
+        and GPU_SELECTION.visible_devices.strip() not in {"", "-1"}
+    )
+    if expects_cuda and not torch.cuda.is_available():
+        raise RuntimeError(
+            "a CUDA device was selected, but this PyTorch process cannot access "
+            "CUDA. Check the CUDA-enabled PyTorch build and container GPU mapping."
+        )
+    if GPU_SELECTION.mode == "unavailable" and torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA is available, but idle-GPU discovery could not run: "
+            f"{GPU_SELECTION.detail}. Set CUDA_VISIBLE_DEVICES explicitly or fix "
+            "nvidia-smi."
+        )
     context = initialize_distributed()
     seed_everything(config.train.seed, 0)
+    runtime_info = {
+        "gpu_selection": asdict(GPU_SELECTION),
+        "world_size": context.world_size,
+        "cuda_device_count": torch.cuda.device_count(),
+        "cuda_device_names": [
+            torch.cuda.get_device_name(index)
+            for index in range(torch.cuda.device_count())
+        ],
+    }
 
     if config.data.manifest_path:
         manifest = validate_data_manifest(
@@ -183,6 +237,8 @@ def main() -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
         with (output_dir / "resolved_config.yaml").open("w", encoding="utf-8") as handle:
             yaml.safe_dump(config.to_dict(), handle, sort_keys=False)
+        with (output_dir / "runtime.json").open("w", encoding="utf-8") as handle:
+            json.dump(runtime_info, handle, indent=2)
     barrier(context)
 
     model = DecoderLM(config.model).to(context.device)
@@ -260,7 +316,7 @@ def main() -> None:
         token_limited_steps = math.ceil(config.train.max_tokens / tokens_per_step)
         total_steps = min(total_steps, token_limited_steps) if total_steps > 0 else token_limited_steps
 
-    wandb_run = maybe_initialize_wandb(config, context)
+    wandb_run = maybe_initialize_wandb(config, context, runtime_info)
     metrics_path = output_dir / "metrics.jsonl"
     last_log_time = time.perf_counter()
     last_logged_tokens = tokens_seen

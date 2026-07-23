@@ -42,9 +42,24 @@ MoE model, a difference of about 0.015%.
 
 ## Training
 
+If `CUDA_VISIBLE_DEVICES` is unset, `train.py` queries `nvidia-smi` before
+importing PyTorch, excludes GPUs with compute processes or more than 1 GiB of
+allocated memory, and reserves the best idle GPU(s) with a local lock. An
+explicit `CUDA_VISIBLE_DEVICES` value always takes precedence.
+
 ```bash
 torchrun --standalone --nproc_per_node=4 train.py \
   --config configs/distributional_moe_500m.yaml
+```
+
+For one A100 while preserving the original effective global batch:
+
+```bash
+unset CUDA_VISIBLE_DEVICES
+torchrun --standalone --nproc_per_node=1 train.py \
+  --config configs/distributional_moe_500m.yaml \
+  --override train.micro_batch_size=4 \
+  --override train.gradient_accumulation_steps=64
 ```
 
 Change top-k without changing the parameter count:

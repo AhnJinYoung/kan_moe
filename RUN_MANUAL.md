@@ -1,4 +1,4 @@
-# Run manual: 4 x A100 80GB
+# Run manual: 1–4 x A100 80GB
 
 이 문서는 GPU 서버의 저장 위치를 다음과 같이 고정한다.
 
@@ -28,12 +28,29 @@ export OMP_NUM_THREADS=8
 ```
 
 CUDA용 PyTorch가 이미 설치된 서버 환경을 전제로 한다. 다음 결과에서
-GPU 네 개와 BF16 지원 여부를 먼저 확인한다.
+사용 가능한 GPU와 BF16 지원 여부를 먼저 확인한다.
 
 ```bash
 python3 -c 'import torch; print(torch.__version__, torch.version.cuda); print(torch.cuda.device_count(), torch.cuda.is_bf16_supported())'
 nvidia-smi
 ```
+
+`CUDA_VISIBLE_DEVICES`가 설정되지 않았으면 `train.py`가 PyTorch를 import하기
+전에 `nvidia-smi`를 조회한다. 다른 compute process가 없고 사용 중인 GPU
+memory가 1GiB 이하인 장치만 선택하며, 동시에 시작한 이 프로젝트의 다른
+run과 충돌하지 않도록 `/tmp` lock을 유지한다. `torchrun`의
+`--nproc_per_node`만큼 idle GPU가 없으면 기존 작업을 침범하지 않고 실패한다.
+
+명시적인 `CUDA_VISIBLE_DEVICES`가 있으면 자동 선택보다 우선한다. 자동 선택을
+사용하려면 다음처럼 기존 값을 제거한다.
+
+```bash
+unset CUDA_VISIBLE_DEVICES
+```
+
+강제로 기존 CUDA 동작을 사용하려면 `--no-auto-select-gpu`를 추가하거나
+`DMOE_AUTO_SELECT_GPU=0`을 설정한다. idle 판정의 허용 memory는 기본
+1,024MiB이며 필요하면 `DMOE_GPU_MAX_USED_MEMORY_MIB`로 조정할 수 있다.
 
 ## 2. FineWeb-Edu sample-100BT 전처리
 
@@ -94,8 +111,7 @@ python3 scripts/count_parameters.py \
 검증한다. 네 GPU에서 optimizer step당 524,288 tokens이므로 약 191 steps다.
 
 ```bash
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-
+unset CUDA_VISIBLE_DEVICES
 torchrun --standalone --nproc_per_node=4 train.py \
   --config configs/distributional_moe_500m.yaml \
   --override train.max_tokens=100000000 \
@@ -153,6 +169,21 @@ done
 gradient accumulation 32, 5B tokens, seed 1337, global batch 524,288
 tokens이며 최종 step은 9,537이다. micro-batch까지 통일했으므로 rank별
 sampler가 세 모델에 동일한 token window 순서를 공급한다.
+
+단일 A100에서는 같은 effective global batch를 유지하기 위해 micro-batch
+4와 accumulation 64를 권장한다. OOM이면 각각 2와 128로 바꾼다.
+
+```bash
+unset CUDA_VISIBLE_DEVICES
+torchrun --standalone --nproc_per_node=1 train.py \
+  --config configs/distributional_moe_500m.yaml \
+  --override train.micro_batch_size=4 \
+  --override train.gradient_accumulation_steps=64 \
+  --override train.wandb_project=kan-moe \
+  --override train.wandb_run_name=dmoe-hellinger-k2-5b-1gpu
+```
+
+아래는 네 GPU 비교 명령이다.
 
 ```bash
 torchrun --standalone --nproc_per_node=4 train.py \
