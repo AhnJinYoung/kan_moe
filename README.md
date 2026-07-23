@@ -64,7 +64,7 @@ unset CUDA_VISIBLE_DEVICES
 torchrun --standalone --nproc_per_node=1 train.py \
   --config configs/distributional_moe_500m.yaml \
   --override train.wandb_project=kan-moe \
-  --override train.wandb_run_name=dmoe-hellinger-k2-2b-1gpu
+  --override train.wandb_run_name=dmoe-hellinger-k2-50k-1gpu
 ```
 
 Change top-k without changing the parameter count:

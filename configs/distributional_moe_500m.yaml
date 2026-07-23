@@ -43,10 +43,10 @@ train:
   output_dir: /data/umoe_mod_share/kan_moe/outputs/distributional_moe_500m_k2
   seed: 1337
   sequence_length: 2048
-  micro_batch_size: 16
-  gradient_accumulation_steps: 4
+  micro_batch_size: 64
+  gradient_accumulation_steps: 1
   max_steps: 50000
-  max_tokens: 2000000000
+  max_tokens: 20000000000
   learning_rate: 0.0003
   min_learning_rate: 0.00003
   warmup_steps: 200
