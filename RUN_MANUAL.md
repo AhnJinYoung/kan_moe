@@ -188,8 +188,8 @@ done
 
 ## 6. 주 비교
 
-한 번에 하나씩 실행한다. YAML의 기본값은 모두 micro-batch 64/GPU,
-gradient accumulation 1, `max_steps: 50000`, `max_tokens: 20B`, seed
+한 번에 하나씩 실행한다. YAML의 기본값은 모두 micro-batch 32/GPU,
+gradient accumulation 2, `max_steps: 50000`, `max_tokens: 20B`, seed
 1337이다. 한 GPU에서는 optimizer step당 131,072 tokens이므로 50,000-step
 상한이 먼저 적용되어 최대 6.554B tokens를 학습한다. 네 GPU에서는 optimizer
 step당 524,288 tokens이며 20B-token 상한이 먼저 적용되어 38,147 steps를

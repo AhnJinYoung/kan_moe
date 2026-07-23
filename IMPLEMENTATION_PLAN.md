@@ -366,8 +366,8 @@ will be reported against tokens, active-parameter estimates, measured
 tokens/second, and wall-clock time. Wasserstein and learned `rho` are enabled
 only after the fixed, closed-form comparisons are stable.
 
-All primary runs use the same micro-batch 64 per GPU, no gradient
-accumulation, 20B-token cap, 50,000-step cap, data split, seed, and schedule.
+All primary runs use the same micro-batch 32 per GPU, two gradient
+accumulation steps, 20B-token cap, 50,000-step cap, data split, seed, and schedule.
 The two limits are both hard stopping criteria. On one GPU, 50,000 steps at
 131,072 tokens/step process at most 6.554B tokens. On four GPUs, the 20B-token
 cap is reached after 38,147 steps at 524,288 tokens/step. Before those runs, a
