@@ -73,6 +73,24 @@ class ModelTest(unittest.TestCase):
             )
         )
 
+    def test_moe_variants_support_bf16_autocast(self) -> None:
+        for model_type in ("vanilla_moe", "distributional_moe"):
+            torch.manual_seed(11)
+            model = DecoderLM(tiny_config(model_type))
+            model.train()
+            inputs = torch.randint(0, 101, (2, 8))
+            with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+                outputs = model(inputs, inputs)
+            self.assertTrue(torch.isfinite(outputs["loss"]), model_type)
+            outputs["loss"].backward()
+            self.assertTrue(
+                all(
+                    parameter.grad is None or torch.isfinite(parameter.grad).all()
+                    for parameter in model.parameters()
+                ),
+                model_type,
+            )
+
     def test_500m_parameter_contract_on_meta_device(self) -> None:
         common = dict(
             vocab_size=32_000,

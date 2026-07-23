@@ -188,8 +188,8 @@ done
 
 ## 6. 2B-token 주 비교
 
-한 번에 하나씩 실행한다. YAML의 기본값은 모두 micro-batch 2/GPU,
-gradient accumulation 32, `max_steps: 50000`, 2B tokens, seed 1337이다.
+한 번에 하나씩 실행한다. YAML의 기본값은 모두 micro-batch 16/GPU,
+gradient accumulation 4, `max_steps: 50000`, 2B tokens, seed 1337이다.
 현재 batch에서는 `max_tokens`가 먼저 종료 조건이 된다. 한 GPU에서는
 optimizer step당 131,072 tokens로 15,259 steps, 네 GPU에서는 524,288
 tokens로 3,815 steps다. 세 모델은 같은 row order와 online packing 규칙을

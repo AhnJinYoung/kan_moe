@@ -79,12 +79,17 @@ class SparseMoE(nn.Module):
             output_chunks.append(expert(expert_inputs))
             position_chunks.append(positions)
 
-        flat_output = inputs.new_zeros(n_tokens * top_k, self.d_model)
         if output_chunks:
             outputs = torch.cat(output_chunks, dim=0)
             positions = torch.cat(position_chunks, dim=0)
+            # Under autocast the normalized residual input remains FP32 while
+            # expert Linear outputs are BF16/FP16. index_copy requires exact
+            # dtype agreement, so allocate in the actual expert output dtype.
+            flat_output = outputs.new_zeros(n_tokens * top_k, self.d_model)
             flat_output = flat_output.index_copy(0, positions, outputs)
-        flat_output = flat_output + unused_parameter_zero
+        else:
+            flat_output = inputs.new_zeros(n_tokens * top_k, self.d_model)
+        flat_output = flat_output + unused_parameter_zero.to(flat_output.dtype)
         return flat_output.reshape(n_tokens, top_k, self.d_model)
 
     def forward(
@@ -154,4 +159,3 @@ class SparseMoE(nn.Module):
             ],
         }
         return flat_output.reshape(original_shape), auxiliary_loss, metrics
-
